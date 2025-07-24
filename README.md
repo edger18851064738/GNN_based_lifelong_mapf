@@ -10,7 +10,7 @@
 
 **论文作者**: Biao Xu, Guan Wang, Zeyu Yang, Yougang Bian, Xiaowei Wang, Manjiang Hu  
 **发表期刊**: IEEE Transactions on Intelligent Transportation Systems, 2024  
-**研究单位**: 湖南大学汽车车身先进设计制造国家重点实验室
+
 
 ## 📖 项目简介
 
@@ -354,16 +354,5 @@ green_additional_safety = 2.0  # 默认1.3
 
 本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
 
-## 👥 作者
 
-- **主要开发者** - 论文算法实现与系统集成
-- **研究指导** - 理论基础与算法优化
-
-## 🙏 致谢
-
-- 感谢 IEEE TITS 期刊的研究支持
-- 感谢开源社区提供的优秀工具和库
-- 感谢所有测试用户的反馈与建议
-
----
 ⭐ 如果这个项目对您有帮助，请给它一个星标！
