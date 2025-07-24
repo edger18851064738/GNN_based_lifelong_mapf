@@ -3,22 +3,36 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Paper](https://img.shields.io/badge/Paper-IEEE%20TITS-green.svg)](https://ieeexplore.ieee.org/)
+[![DOI](https://img.shields.io/badge/DOI-10.1109/TITS.2024.3383825-blue.svg)](https://doi.org/10.1109/TITS.2024.3383825)
 
-> **IEEE TITS 论文复现项目**  
-> *Multi-Vehicle Collaborative Trajectory Planning with Complete Mathematical Models*
+> **IEEE TITS 2024 论文完整复现**  
+> *Multi-Vehicle Collaborative Trajectory Planning in Unstructured Conflict Areas Based on V-Hybrid A**
+
+**论文作者**: Biao Xu, Guan Wang, Zeyu Yang, Yougang Bian, Xiaowei Wang, Manjiang Hu  
+**发表期刊**: IEEE Transactions on Intelligent Transportation Systems, 2024  
+**研究单位**: 湖南大学汽车车身先进设计制造国家重点实验室
 
 ## 📖 项目简介
 
-本项目是对多车协同轨迹规划算法的完整实现，基于V-Hybrid A*算法并集成了图神经网络(GNN)增强的智能决策机制。项目包含了从基础算法到深度学习增强的完整技术栈。
+本项目是对IEEE TITS 2024论文"Multi-Vehicle Collaborative Trajectory Planning in Unstructured Conflict Areas Based on V-Hybrid A*"的完整复现实现。论文提出了一种集中决策分布式规划框架，专门解决非结构化冲突区域(如露天矿区、停车场)的多车协同轨迹规划问题。
 
-### 🎯 主要特色
+### 🎯 核心算法特色 (严格按论文实现)
 
-- **📐 精确运动学模型** - 严格按论文公式(3-10)实现，包含完整转弯半径计算
-- **⚙️ 完整QP优化** - 实现论文公式(17-18, 26-27)的路径和速度双重优化  
-- **🧠 GNN智能决策** - 图神经网络增强的多车协调策略
-- **🛡️ 分层安全策略** - 动态安全距离切换(绿色/黄色安全区域)
-- **🗺️ 3D时空地图** - 真实时空维度的资源分配和冲突检测
-- **🎬 实时可视化** - 精确的动画展示和冲突监控
+- **🚗 V-Hybrid A* 搜索** - 四维(x,y,θ,v)时空轨迹搜索算法 
+- **📐 精确运动学模型** - 严格按论文公式(3-10)实现自行车模型和转弯半径计算
+- **⚙️ 双阶段QP优化** - 路径优化(公式17-18)和速度优化(公式26-27)  
+- **🗺️ 3D时空地图** - 基于资源块分配的时空冲突检测(公式1)
+- **📊 ST图凸空间** - Algorithm 2实现的动态避障约束生成
+- **🛡️ 分层安全策略** - 搜索阶段(绿色)和优化阶段(黄色)的动态安全距离
+- **🧠 GNN智能增强** - 额外集成的图神经网络协调决策(非论文原创)
+- **🎬 实时可视化** - 完整的多车协同过程展示和冲突监控
+
+### 🏭 应用场景
+
+- **露天矿区**: 满载和空载矿车的复杂路口协调
+- **停车场**: 多车辆的非结构化环境导航  
+- **工业园区**: 自动引导车辆(AGV)的协同调度
+- **多叉路口**: 不规则边界和内部障碍物的复杂交叉口
 
 ## 🎬 演示效果
 
@@ -154,31 +168,87 @@ python GNN_try.py
 }
 ```
 
-## 🔬 核心算法
+## 🔬 核心算法 (严格按论文公式实现)
 
-### 1. 精确运动学模型 (公式3-10)
+### 1. V-Hybrid A* 四维搜索 (论文Section III)
 
 ```python
-# 转弯半径计算
-Rr = wheelbase / tan(steering_angle)
-
-# 位置更新 (曲线运动)
-x_new = x + Rr * (sin(θ_new) - sin(θ))
-y_new = y + Rr * (cos(θ) - cos(θ_new))
+# 状态空间: s(x, y, θ, v)
+# 运动学更新 (公式3-10)
+v_n+1 = v_n + a_i * ΔT                    # 公式(3)
+R_r = L / tan(δ_j)                        # 公式(4) - 转弯半径
+Δd = v_n+1 * ΔT                          # 公式(5)
+Δθ = (Δd/L) * tan(δ_j)                   # 公式(6)
+θ_n+1 = θ_n + Δθ                         # 公式(7)
+x_n+1 = x_n + R_r * (sin(θ_n+1) - sin(θ_n))  # 公式(8)
+y_n+1 = y_n + R_r * (cos(θ_n) - cos(θ_n+1))  # 公式(9)
+t_n+1 = t_n + ΔT                         # 公式(10)
 ```
 
-### 2. QP路径优化 (公式17-18)
+### 2. 3D时空资源块分配 (公式1)
 
 ```python
-minimize: ωs·smoothness + ωr·reference_tracking + ωl·length_uniformity
-subject to: boundary_conditions + safety_constraints
+# 资源块定义
+R^XYT_ix,iy,it = {
+    (x,y,t) | (ix-1)*dx ≤ x < ix*dx,
+              (iy-1)*dy ≤ y < iy*dy,  
+              (it-1)*dt ≤ t < it*dt
+}
+
+# 车辆冲突避免约束 (公式2)
+R^XYT_i1,V1 ∩ R^XYT_i2,V2 = ∅
 ```
 
-### 3. QP速度优化 (公式26-27)
+### 3. 路径QP优化 (公式17-18)
 
 ```python
-minimize: ωv·speed_tracking + ωa·acceleration + ωj·jerk  
-subject to: kinematics + convex_space_constraints
+minimize: F_p = ω_s·f_s(X) + ω_r·f_r(X) + ω_l·f_l(X)
+
+subject to:
+    # 边界条件
+    [x(0), y(0)] = [x_0, y_0]
+    [x(N), y(N)] = [x_end, y_end]
+    # 安全箱约束 (公式18)
+    x_lb_k ≤ x(k) ≤ x_ub_k
+    y_lb_k ≤ y(k) ≤ y_ub_k
+```
+
+### 4. 速度QP优化 (公式26-27)
+
+```python
+minimize: F_v = ω_v·f_v(S) + ω_a·f_a(S) + ω_j·f_jerk(S)
+
+subject to:
+    # 运动学连续性约束
+    s_k + ṡ_k*ΔT + (1/3)*s̈_k*ΔT² - s_k+1 + (1/6)*s̈_k+1*ΔT² = 0
+    ṡ_k + (1/2)*s̈_k*ΔT - ṡ_k+1 + (1/2)*s̈_k+1*ΔT = 0
+    # ST图凸空间约束 (Algorithm 2结果)
+    O_lb < s_k < O_ub
+    # 物理约束
+    0 ≤ ṡ(k) ≤ v_max
+    a_min ≤ s̈(k) ≤ a_max
+```
+
+### 5. ST图凸空间创建 (Algorithm 2)
+
+```python
+def create_convex_space(high_priority_trajectories, initial_traj, smooth_traj):
+    """根据论文Algorithm 2创建ST图凸空间"""
+    O_lb, O_ub = [], []
+    
+    for Ti in high_priority_trajectories:
+        conflict_points = find_conflict_points(Ti, smooth_traj)
+        
+        for point in conflict_points:
+            s_proj = project_to_initial_trajectory(point, initial_traj)
+            s_init = get_distance_at_time(initial_traj, point.time)
+            
+            if s_proj < s_init:  # 需要加速避障
+                O_lb.append(find_lower_boundary(point, smooth_traj))
+            else:  # 需要减速避障  
+                O_ub.append(find_upper_boundary(point, smooth_traj))
+    
+    return O_lb, O_ub
 ```
 
 ## 📈 性能展示
