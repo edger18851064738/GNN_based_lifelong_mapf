@@ -1246,7 +1246,7 @@ class VehicleParameters:
         self.width = 1.6            # 车宽 - 合理长宽比1.75:1
         
         # 🎯 优化后的分层安全策略 - 降低地图占用率
-        self.green_additional_safety = 1.30   # 搜索阶段
+        self.green_additional_safety = 1.40   # 搜索阶段
         self.yellow_safety = 1.0             # 速度优化阶段
         
         self.current_planning_stage = "search"
