@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-🚀 增强版第一轮多车轨迹规划系统 - 集成GAT智能协调
-在原有lifelong_planning基础上集成GAT模块，提供智能协调决策
+终身GNN路口规划系统 - 完整版
+基于原有 lifelong_planning.py，集成 GNN 增强功能
 
-主要增强：
-1. 集成GAT智能协调系统
-2. 车辆交互图分析
-3. 动态优先级调整
-4. 智能协调策略应用
-5. 保持原有接口兼容性
+核心特性:
+✅ 每条出入口边一个任务，边上随机整数起点 → 非相邻边随机整数终点
+✅ 可选的GNN增强规划 (继承 GNN_try.py)
+✅ 智能优先级分配 (继承 priority.py)
+✅ 高级可视化 (继承 trying.py)
+✅ 冲突强度分析和控制
 
 流程:
-1. 载入地图，生成任务
-2. 构建车辆交互图
-3. GAT智能决策推理
-4. 应用协调指导规划所有车辆
-5. 可视化结果
+1. 载入路口地图
+2. 每条出入口边生成一个任务：边上随机整数起点 → 排除最近两条边后随机选择终点边上随机整数终点
+3. 可选使用GNN增强规划或基础规划
+4. 智能优先级分配
+5. 批次规划所有车辆
+6. 高级可视化展示
 """
 
 import numpy as np
@@ -30,32 +31,42 @@ import random
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 from collections import deque
-
+from Pretraining_gnn import SafetyEnhancedTrainingConfig as TrainingConfig
 # 导入核心规划模块
 from trying import (
     VehicleState, VehicleParameters, OptimizationLevel,
     UnstructuredEnvironment, VHybridAStarPlanner
 )
 
-# 🆕 导入GAT协调模块
+# 导入GNN增强组件 (可选)
 try:
-    from GAT import (
-        VehicleGraphBuilder, VehicleGATNetwork, DecisionParser, 
-        IntegratedPlanner, CoordinationGuidance, VehicleGraphData,
-        GATDecisions
+    from GNN_try import (
+        PretrainedGNNIntegratedCoordinator, 
+        GNNEnhancementLevel
     )
-    HAS_GAT = True
-    print("✅ GAT模块导入成功")
-except ImportError as e:
-    HAS_GAT = False
-    print(f"⚠️ GAT模块导入失败: {e}")
+    HAS_GNN_INTEGRATION = True
+    print("✅ GNN增强模块可用")
+except ImportError:
+    HAS_GNN_INTEGRATION = False
+    print("⚠️ GNN增强模块不可用，将使用基础规划")
 
-# 可选导入智能优先级模块
+# 导入高级可视化组件 (可选)
+try:
+    from trying import MultiVehicleCoordinator
+    HAS_ADVANCED_VISUALIZATION = True
+    print("✅ 高级可视化模块可用")
+except ImportError:
+    HAS_ADVANCED_VISUALIZATION = False
+    print("⚠️ 将使用简单可视化")
+
+# 导入智能优先级模块 (可选)
 try:
     from priority import IntelligentPriorityAssigner
     HAS_INTELLIGENT_PRIORITY = True
+    print("✅ 智能优先级模块可用")
 except ImportError:
     HAS_INTELLIGENT_PRIORITY = False
+    print("⚠️ 将使用默认优先级")
 
 @dataclass
 class IntersectionEdge:
@@ -95,36 +106,72 @@ class IntersectionEdge:
 
 @dataclass  
 class Task:
-    """任务定义"""
+    """简单任务"""
     task_id: int
     start_edge: IntersectionEdge
     end_edge: IntersectionEdge
     start_pos: Tuple[int, int]
     end_pos: Tuple[int, int]
     priority: int = 1
-    # 🆕 GAT相关字段
-    gat_strategy: str = "normal"
-    cooperation_score: float = 0.5
-    urgency_level: float = 0.5
-    safety_factor: float = 0.5
 
 @dataclass
 class Vehicle:
-    """车辆定义"""
+    """简单车辆"""
     vehicle_id: int
     task: Task
     trajectory: List[VehicleState] = None
     color: str = "blue"
     planning_time: float = 0.0
-    # 🆕 GAT相关字段
-    gat_guidance: Optional[CoordinationGuidance] = None
 
-class EnhancedFirstRoundPlanner:
-    """🚀 增强版第一轮多车规划器 - 集成GAT智能协调"""
+class ConflictIntensityAnalyzer:
+    """冲突强度分析器"""
     
-    def __init__(self, map_file: str, optimization_level: OptimizationLevel = OptimizationLevel.ENHANCED,
-                 enable_gat: bool = True):
-        # 基础环境设置
+    @staticmethod
+    def analyze_scenario_conflicts(vehicles: List[Vehicle]) -> Dict:
+        """分析场景冲突强度"""
+        if len(vehicles) < 2:
+            return {'intensity': 0.0, 'conflicts': [], 'total_pairs': 0, 'conflict_count': 0}
+        
+        conflicts = []
+        total_pairs = 0
+        
+        for i in range(len(vehicles)):
+            for j in range(i + 1, len(vehicles)):
+                v1, v2 = vehicles[i], vehicles[j]
+                total_pairs += 1
+                
+                # 检查路径是否交叉
+                if ConflictIntensityAnalyzer._paths_intersect(
+                    v1.task.start_pos, v1.task.end_pos,
+                    v2.task.start_pos, v2.task.end_pos
+                ):
+                    conflicts.append((v1.vehicle_id, v2.vehicle_id))
+        
+        intensity = len(conflicts) / max(total_pairs, 1)
+        
+        return {
+            'intensity': intensity,
+            'conflicts': conflicts,
+            'total_pairs': total_pairs,
+            'conflict_count': len(conflicts)
+        }
+    
+    @staticmethod
+    def _paths_intersect(start1: tuple, end1: tuple, start2: tuple, end2: tuple) -> bool:
+        """检查两条路径是否交叉"""
+        def ccw(A, B, C):
+            return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
+        
+        def intersect(A, B, C, D):
+            return ccw(A,C,D) != ccw(B,C,D) and ccw(A,B,C) != ccw(A,B,D)
+        
+        return intersect(start1, end1, start2, end2)
+
+class FirstRoundPlanner:
+    """第一轮多车规划器 - 基础版"""
+    
+    def __init__(self, map_file: str, optimization_level: OptimizationLevel = OptimizationLevel.ENHANCED):
+        # 加载地图
         self.environment = UnstructuredEnvironment()
         self.map_data = self.environment.load_from_json(map_file)
         
@@ -133,13 +180,6 @@ class EnhancedFirstRoundPlanner:
         
         self.params = VehicleParameters()
         self.optimization_level = optimization_level
-        
-        # 🆕 GAT系统初始化
-        self.enable_gat = enable_gat and HAS_GAT
-        if self.enable_gat:
-            self._initialize_gat_system()
-        else:
-            print("ℹ️ GAT系统未启用，使用传统规划")
         
         # 加载出入口边
         self.edges = self._load_edges()
@@ -155,41 +195,11 @@ class EnhancedFirstRoundPlanner:
         self.successful_plannings = 0
         self.planning_start_time = time.time()
         
-        # 🆕 GAT性能统计
-        self.gat_stats = {
-            'graph_construction_time': 0.0,
-            'inference_time': 0.0,
-            'decision_parsing_time': 0.0,
-            'coordination_applications': 0
-        }
-        
-        print(f"🚀 增强版第一轮规划器初始化完成")
+        print(f"🚀 第一轮规划器初始化")
         print(f"   地图: {self.map_data.get('map_info', {}).get('name', 'Unknown')}")
         print(f"   出入口边: {len(self.edges)} 个")
         print(f"   生成任务: {len(self.tasks)} 个")
         print(f"   创建车辆: {len(self.vehicles)} 个")
-        print(f"   GAT智能协调: {'✅ 启用' if self.enable_gat else '❌ 禁用'}")
-        print(f"   优化级别: {optimization_level.value}")
-    
-    def _initialize_gat_system(self):
-        """🆕 初始化GAT系统组件"""
-        try:
-            self.graph_builder = VehicleGraphBuilder(interaction_radius=50.0)
-            self.gat_network = VehicleGATNetwork()
-            self.decision_parser = DecisionParser()
-            self.integrated_planner = IntegratedPlanner(self.environment, self.optimization_level)
-            
-            # 设置GAT网络为推理模式
-            self.gat_network.eval()
-            
-            print("   🧠 GAT系统组件初始化成功")
-            print(f"     - 图构建器: 交互半径50.0m")
-            print(f"     - GAT网络: 15维节点 + 10维边 + 8维全局特征")
-            print(f"     - 集成规划器: {self.optimization_level.value}级别")
-            
-        except Exception as e:
-            print(f"❌ GAT系统初始化失败: {e}")
-            self.enable_gat = False
     
     def _load_edges(self) -> List[IntersectionEdge]:
         """加载出入口边"""
@@ -206,16 +216,16 @@ class EnhancedFirstRoundPlanner:
         return edges
     
     def _generate_tasks(self) -> List[Task]:
-        """为每个出入口边生成一个任务"""
+        """为每个出入口边生成一个任务 - 边上随机整数起点 → 非相邻边随机整数终点"""
         tasks = []
         
         for i, start_edge in enumerate(self.edges):
-            # 选择非相邻的终点边
+            # 选择非相邻的终点边（排除距离最近的两条）
             end_edge = self._select_non_adjacent_edge(start_edge)
             if not end_edge:
                 continue
             
-            # 生成整数坐标的起点和终点
+            # 🎯 在边上生成随机整数坐标的起点和终点
             start_pos = start_edge.get_random_integer_position()
             end_pos = end_edge.get_random_integer_position()
             
@@ -225,7 +235,7 @@ class EnhancedFirstRoundPlanner:
                 end_edge=end_edge,
                 start_pos=start_pos,
                 end_pos=end_pos,
-                priority=1  # 默认优先级，后续可能被GAT调整
+                priority=1  # 默认优先级
             )
             tasks.append(task)
             
@@ -254,7 +264,7 @@ class EnhancedFirstRoundPlanner:
         
         edge_distances.sort(key=lambda x: x[1])
         
-        # 排除最近的两条边
+        # 🎯 排除最近的两条边
         if len(edge_distances) <= 2:
             return edge_distances[0][0] if edge_distances else None
         else:
@@ -324,177 +334,41 @@ class EnhancedFirstRoundPlanner:
         except Exception as e:
             print(f"⚠️ 智能优先级应用失败: {e}")
     
-    def _convert_vehicles_to_gat_format(self) -> List[Dict]:
-        """🆕 将车辆信息转换为GAT模块需要的格式"""
-        vehicles_info = []
-        
-        for vehicle in self.vehicles:
-            task = vehicle.task
-            start_x, start_y = task.start_pos
-            end_x, end_y = task.end_pos
-            
-            # 计算朝向
-            dx = end_x - start_x
-            dy = end_y - start_y
-            theta = math.atan2(dy, dx)
-            
-            # 创建起始和目标状态
-            start_state = VehicleState(x=start_x, y=start_y, theta=theta, v=3.0, t=0.0)
-            goal_state = VehicleState(x=end_x, y=end_y, theta=theta, v=2.0, t=0.0)
-            
-            vehicle_info = {
-                'id': vehicle.vehicle_id,
-                'priority': task.priority,
-                'start': start_state,
-                'goal': goal_state,
-                'current_state': start_state,  # GAT需要
-                'goal_state': goal_state,      # GAT需要
-                'color': vehicle.color,
-                'description': f'V{vehicle.vehicle_id}({task.start_edge.edge_id}->{task.end_edge.edge_id})'
-            }
-            vehicles_info.append(vehicle_info)
-        
-        return vehicles_info
-    
-    def apply_gat_coordination(self):
-        """🆕 应用GAT智能协调决策"""
-        if not self.enable_gat:
-            print("ℹ️ GAT系统未启用，跳过智能协调")
-            return
-        
-        print(f"\n🧠 开始GAT智能协调分析...")
-        
-        try:
-            # Step 1: 转换车辆信息格式
-            vehicles_info = self._convert_vehicles_to_gat_format()
-            print(f"   📊 车辆信息转换: {len(vehicles_info)}个车辆")
-            
-            # Step 2: 构建车辆交互图
-            start_time = time.time()
-            graph_data = self.graph_builder.build_graph(vehicles_info)
-            self.gat_stats['graph_construction_time'] = time.time() - start_time
-            
-            print(f"   📈 交互图构建完成: {graph_data.num_nodes}节点, 耗时{self.gat_stats['graph_construction_time']:.3f}s")
-            
-            # Step 3: GAT智能推理
-            start_time = time.time()
-            with np.errstate(all='ignore'):  # 忽略numpy警告
-                import torch
-                with torch.no_grad():
-                    gat_decisions = self.gat_network(graph_data)
-            self.gat_stats['inference_time'] = time.time() - start_time
-            
-            print(f"   🎯 GAT推理完成: 耗时{self.gat_stats['inference_time']:.3f}s")
-            
-            # Step 4: 解析决策指导
-            start_time = time.time()
-            guidance_list = self.decision_parser.parse_decisions(gat_decisions, vehicles_info)
-            self.gat_stats['decision_parsing_time'] = time.time() - start_time
-            
-            print(f"   📋 决策解析完成: {len(guidance_list)}个指导策略, 耗时{self.gat_stats['decision_parsing_time']:.3f}s")
-            
-            # Step 5: 应用协调指导到车辆
-            self._apply_coordination_guidance(guidance_list)
-            
-            print(f"✅ GAT智能协调应用成功")
-            
-        except Exception as e:
-            print(f"❌ GAT智能协调失败: {str(e)}")
-            import traceback
-            traceback.print_exc()
-    
-    def _apply_coordination_guidance(self, guidance_list: List[CoordinationGuidance]):
-        """🆕 应用协调指导到车辆和任务"""
-        print(f"   🎯 应用协调指导:")
-        
-        for guidance in guidance_list:
-            # 找到对应的车辆
-            vehicle = next((v for v in self.vehicles if v.vehicle_id == guidance.vehicle_id), None)
-            if not vehicle:
-                continue
-            
-            # 保存GAT指导
-            vehicle.gat_guidance = guidance
-            
-            # 更新任务优先级和策略
-            vehicle.task.priority = guidance.adjusted_priority
-            vehicle.task.gat_strategy = guidance.strategy
-            vehicle.task.cooperation_score = guidance.cooperation_score
-            vehicle.task.urgency_level = guidance.urgency_level
-            vehicle.task.safety_factor = guidance.safety_factor
-            
-            self.gat_stats['coordination_applications'] += 1
-            
-            print(f"     V{guidance.vehicle_id}: {guidance.strategy}, "
-                  f"优先级{guidance.adjusted_priority:.1f}, "
-                  f"合作{guidance.cooperation_score:.2f}, "
-                  f"紧急{guidance.urgency_level:.2f}, "
-                  f"安全{guidance.safety_factor:.2f}")
-    
     def plan_all_vehicles(self):
-        """🚀 使用GAT增强的多车规划"""
-        print(f"\n🎯 开始GAT增强的多车规划...")
-        print(f"   车辆数量: {len(self.vehicles)}")
-        print(f"   GAT系统: {'✅ 启用' if self.enable_gat else '❌ 禁用'}")
+        """同时规划所有车辆 - 基础版本"""
+        print(f"\n🎯 基础规划模式: {len(self.vehicles)} 个车辆...")
         
-        # 按优先级排序（可能已被GAT调整）
+        # 按优先级排序
         self.vehicles.sort(key=lambda v: v.task.priority, reverse=True)
         
-        # 显示最终优先级排序
-        print(f"   📊 最终优先级排序:")
-        for i, vehicle in enumerate(self.vehicles):
-            strategy_info = f" [{vehicle.task.gat_strategy}]" if self.enable_gat else ""
-            print(f"     {i+1}. V{vehicle.vehicle_id}: 优先级{vehicle.task.priority}{strategy_info}")
-        
-        # 执行规划
+        # 同时规划所有车辆
         successful_trajectories = []
         
         for vehicle in self.vehicles:
-            print(f"\n   🚗 规划车辆 V{vehicle.vehicle_id}")
-            print(f"      优先级: {vehicle.task.priority}")
-            if self.enable_gat and vehicle.gat_guidance:
-                guidance = vehicle.gat_guidance
-                print(f"      GAT策略: {guidance.strategy}")
-                print(f"      协调参数: 合作{guidance.cooperation_score:.2f}, 紧急{guidance.urgency_level:.2f}, 安全{guidance.safety_factor:.2f}")
+            print(f"   规划车辆 V{vehicle.vehicle_id} (优先级 {vehicle.task.priority})")
             
-            trajectory = self._plan_single_vehicle_enhanced(vehicle, successful_trajectories)
-            
+            trajectory = self._plan_single_vehicle(vehicle, successful_trajectories)
             if trajectory:
                 vehicle.trajectory = trajectory
                 successful_trajectories.append(trajectory)
                 self.successful_plannings += 1
-                print(f"      ✅ 成功: {len(trajectory)} 个轨迹点, 耗时{vehicle.planning_time:.2f}s")
+                print(f"      ✅ 成功: {len(trajectory)} 个轨迹点")
             else:
-                print(f"      ❌ 失败, 耗时{vehicle.planning_time:.2f}s")
+                print(f"      ❌ 失败")
         
-        # 统计结果
         total_time = time.time() - self.planning_start_time
         success_rate = (self.successful_plannings / self.total_vehicles) * 100
         
-        print(f"\n📊 规划结果总结:")
+        print(f"\n📊 基础规划结果:")
         print(f"   总车辆: {self.total_vehicles}")
         print(f"   成功: {self.successful_plannings}")
         print(f"   成功率: {success_rate:.1f}%")
         print(f"   总时间: {total_time:.2f}s")
-        print(f"   平均时间: {total_time/self.total_vehicles:.2f}s/车")
-        
-        # 🆕 GAT性能统计
-        if self.enable_gat:
-            print(f"\n🧠 GAT系统性能:")
-            print(f"   图构建: {self.gat_stats['graph_construction_time']:.3f}s")
-            print(f"   推理时间: {self.gat_stats['inference_time']:.3f}s") 
-            print(f"   决策解析: {self.gat_stats['decision_parsing_time']:.3f}s")
-            print(f"   应用次数: {self.gat_stats['coordination_applications']}")
-            
-            total_gat_time = (self.gat_stats['graph_construction_time'] + 
-                             self.gat_stats['inference_time'] + 
-                             self.gat_stats['decision_parsing_time'])
-            print(f"   GAT总耗时: {total_gat_time:.3f}s ({100*total_gat_time/total_time:.1f}%)")
         
         return success_rate >= 50  # 成功率超过50%认为成功
     
-    def _plan_single_vehicle_enhanced(self, vehicle: Vehicle, existing_trajectories: List) -> Optional[List[VehicleState]]:
-        """🆕 使用GAT指导的增强单车规划"""
+    def _plan_single_vehicle(self, vehicle: Vehicle, existing_trajectories: List) -> Optional[List[VehicleState]]:
+        """规划单个车辆"""
         task = vehicle.task
         start_x, start_y = task.start_pos
         end_x, end_y = task.end_pos
@@ -507,25 +381,16 @@ class EnhancedFirstRoundPlanner:
         start_state = VehicleState(x=start_x, y=start_y, theta=theta, v=3.0, t=0.0)
         goal_state = VehicleState(x=end_x, y=end_y, theta=theta, v=2.0, t=0.0)
         
-        planning_start = time.time()
+        # 创建规划器并规划
+        planner = VHybridAStarPlanner(self.environment, self.optimization_level)
         
+        planning_start = time.time()
         try:
-            if self.enable_gat and vehicle.gat_guidance:
-                # 🆕 使用GAT集成规划器
-                trajectory = self.integrated_planner.plan_single_vehicle(
-                    start_state, goal_state, vehicle.vehicle_id, 
-                    vehicle.gat_guidance, existing_trajectories
-                )
-            else:
-                # 使用传统规划器
-                planner = VHybridAStarPlanner(self.environment, self.optimization_level)
-                trajectory = planner.search_with_waiting(
-                    start_state, goal_state, vehicle.vehicle_id, existing_trajectories
-                )
-            
+            trajectory = planner.search_with_waiting(
+                start_state, goal_state, vehicle.vehicle_id, existing_trajectories
+            )
             vehicle.planning_time = time.time() - planning_start
             return trajectory
-            
         except Exception as e:
             vehicle.planning_time = time.time() - planning_start
             print(f"      异常: {str(e)}")
@@ -534,58 +399,262 @@ class EnhancedFirstRoundPlanner:
     def get_successful_vehicles(self) -> List[Vehicle]:
         """获取规划成功的车辆"""
         return [v for v in self.vehicles if v.trajectory is not None]
-    
-    def print_detailed_results(self):
-        """🆕 打印详细的规划结果分析"""
-        print(f"\n📈 详细结果分析:")
-        
-        successful_vehicles = self.get_successful_vehicles()
-        failed_vehicles = [v for v in self.vehicles if v.trajectory is None]
-        
-        print(f"\n✅ 成功车辆 ({len(successful_vehicles)}):")
-        for vehicle in successful_vehicles:
-            traj_length = len(vehicle.trajectory) if vehicle.trajectory else 0
-            total_time = vehicle.trajectory[-1].t if vehicle.trajectory else 0
-            avg_speed = sum(s.v for s in vehicle.trajectory) / len(vehicle.trajectory) if vehicle.trajectory else 0
-            
-            gat_info = ""
-            if self.enable_gat and vehicle.gat_guidance:
-                gat_info = f" | GAT: {vehicle.gat_guidance.strategy}"
-            
-            print(f"   V{vehicle.vehicle_id}: {traj_length}点, {total_time:.1f}s, {avg_speed:.1f}m/s{gat_info}")
-        
-        if failed_vehicles:
-            print(f"\n❌ 失败车辆 ({len(failed_vehicles)}):")
-            for vehicle in failed_vehicles:
-                task_distance = math.sqrt((vehicle.task.end_pos[0] - vehicle.task.start_pos[0])**2 + 
-                                        (vehicle.task.end_pos[1] - vehicle.task.start_pos[1])**2)
-                print(f"   V{vehicle.vehicle_id}: 距离{task_distance:.1f}m, 规划时间{vehicle.planning_time:.2f}s")
-        
-        # 🆕 GAT效果分析
-        if self.enable_gat and successful_vehicles:
-            print(f"\n🧠 GAT效果分析:")
-            strategy_count = {}
-            for vehicle in successful_vehicles:
-                if vehicle.gat_guidance:
-                    strategy = vehicle.gat_guidance.strategy
-                    strategy_count[strategy] = strategy_count.get(strategy, 0) + 1
-            
-            print(f"   策略分布: {strategy_count}")
-            
-            cooperation_scores = [v.gat_guidance.cooperation_score for v in successful_vehicles if v.gat_guidance]
-            if cooperation_scores:
-                avg_cooperation = sum(cooperation_scores) / len(cooperation_scores)
-                print(f"   平均合作度: {avg_cooperation:.3f}")
 
-class EnhancedVisualizer:
-    """🚀 增强版可视化器 - 支持GAT信息显示"""
+class LifelongGNNPlanner(FirstRoundPlanner):
+    """终身GNN规划器 - 继承第一轮规划器，添加GNN增强"""
     
-    def __init__(self, planner: EnhancedFirstRoundPlanner):
+    def __init__(self, map_file: str, 
+                 optimization_level: OptimizationLevel = OptimizationLevel.FULL,
+                 use_gnn: bool = True):
+        
+        # 调用父类初始化
+        super().__init__(map_file, optimization_level)
+        
+        self.use_gnn = use_gnn and HAS_GNN_INTEGRATION
+        
+        if self.use_gnn:
+            print(f"🧠 启用GNN增强模式")
+            # 创建GNN集成协调器
+            self.gnn_coordinator = PretrainedGNNIntegratedCoordinator(
+                map_file_path=map_file,
+                optimization_level=optimization_level,
+                gnn_enhancement_level=GNNEnhancementLevel.PRETRAINED_FULL
+            )
+            
+            # 🔧 修补GNN图构建器以处理特征维度不匹配
+            self._patch_gnn_graph_builder()
+        else:
+            print(f"📋 使用基础规划模式")
+            self.gnn_coordinator = None
+        
+        print(f"🚀 终身GNN规划器初始化完成")
+        print(f"   GNN状态: {'启用' if self.use_gnn else '未启用'}")
+        print(f"   优化级别: {optimization_level.value}")
+    
+    def _patch_gnn_graph_builder(self):
+        """修补GNN图构建器以处理特征维度不匹配"""
+        if hasattr(self.gnn_coordinator, 'pretrained_gnn_planner') and \
+           hasattr(self.gnn_coordinator.pretrained_gnn_planner, 'graph_builder'):
+            
+            graph_builder = self.gnn_coordinator.pretrained_gnn_planner.graph_builder
+            original_extract = graph_builder._extract_enhanced_node_features
+            
+            def patched_extract_features(vehicles_info):
+                """修补的特征提取 - 确保特征维度匹配"""
+                features = original_extract(vehicles_info)
+                
+                # 检查特征维度并进行适配
+                if features and len(features[0]) == 8:
+                    # 从8维扩展到10维
+                    print(f"🔧 特征维度适配: 8维 → 10维")
+                    adapted_features = []
+                    for feature_vec in features:
+                        # 添加两个补充特征
+                        extended_vec = feature_vec + [
+                            0.5,  # [8] 占位特征1
+                            0.5   # [9] 占位特征2
+                        ]
+                        adapted_features.append(extended_vec)
+                    return adapted_features
+                elif features and len(features[0]) == 12:
+                    # 从12维截断到10维
+                    print(f"🔧 特征维度适配: 12维 → 10维")
+                    adapted_features = []
+                    for feature_vec in features:
+                        truncated_vec = feature_vec[:10]  # 截断到前10维
+                        adapted_features.append(truncated_vec)
+                    return adapted_features
+                else:
+                    # 维度已经匹配或其他情况
+                    return features
+            
+            # 替换原有方法
+            graph_builder._extract_enhanced_node_features = patched_extract_features
+            print(f"✅ GNN图构建器已修补，支持特征维度适配")
+    
+    def plan_all_vehicles_with_gnn(self):
+        """使用GNN增强规划所有车辆"""
+        
+        if not self.use_gnn or not self.gnn_coordinator:
+            print("⚠️ GNN不可用，回退到基础规划")
+            return super().plan_all_vehicles()
+        
+        print(f"\n🧠 GNN增强多车规划: {len(self.vehicles)}辆车")
+        
+        # 为GNN协调器准备兼容的地图数据
+        self._prepare_gnn_compatible_map_data()
+        
+        # 更新GNN协调器的地图数据
+        self.gnn_coordinator.map_data = self.map_data
+        
+        try:
+            # 使用GNN集成协调器规划
+            planning_start = time.time()
+            gnn_results, gnn_scenarios = self.gnn_coordinator.plan_with_pretrained_gnn_integration()
+            planning_time = time.time() - planning_start
+            
+            # 转换结果回原格式
+            success_count = self._convert_gnn_results_back(gnn_results)
+            
+            print(f"📊 GNN增强规划结果:")
+            print(f"   成功: {success_count}/{len(self.vehicles)}")
+            print(f"   成功率: {100*success_count/len(self.vehicles):.1f}%")
+            print(f"   规划时间: {planning_time:.2f}s")
+            
+            self.successful_plannings = success_count
+            return success_count >= len(self.vehicles) * 0.5
+            
+        except Exception as e:
+            print(f"❌ GNN规划失败: {str(e)}")
+            print("🔄 回退到基础规划")
+            return super().plan_all_vehicles()
+    
+    def _prepare_gnn_compatible_map_data(self):
+        """为GNN协调器准备兼容的地图数据"""
+        # 如果地图数据中没有 point_pairs，从我们的 vehicles 创建
+        if not self.map_data.get("point_pairs"):
+            start_points = []
+            end_points = []
+            point_pairs = []
+            
+            for vehicle in self.vehicles:
+                task = vehicle.task
+                start_x, start_y = task.start_pos
+                end_x, end_y = task.end_pos
+                
+                # 创建起点
+                start_point = {
+                    "id": vehicle.vehicle_id,
+                    "x": start_x,
+                    "y": start_y
+                }
+                start_points.append(start_point)
+                
+                # 创建终点
+                end_point = {
+                    "id": vehicle.vehicle_id,
+                    "x": end_x,
+                    "y": end_y
+                }
+                end_points.append(end_point)
+                
+                # 创建配对
+                pair = {
+                    "start_id": vehicle.vehicle_id,
+                    "end_id": vehicle.vehicle_id
+                }
+                point_pairs.append(pair)
+            
+            # 更新地图数据
+            self.map_data["start_points"] = start_points
+            self.map_data["end_points"] = end_points
+            self.map_data["point_pairs"] = point_pairs
+            
+            print(f"🔄 为GNN协调器创建了兼容数据: {len(point_pairs)}个配对")
+    
+    def _convert_to_gnn_scenarios(self) -> List[Dict]:
+        """转换为GNN协调器需要的场景格式"""
+        # 为GNN协调器准备兼容的地图数据
+        self._prepare_gnn_compatible_map_data()
+        
+        scenarios = []
+        
+        for vehicle in self.vehicles:
+            task = vehicle.task
+            start_x, start_y = task.start_pos
+            end_x, end_y = task.end_pos
+            
+            # 计算朝向
+            dx = end_x - start_x
+            dy = end_y - start_y
+            theta = math.atan2(dy, dx)
+            
+            scenario = {
+                'id': vehicle.vehicle_id,
+                'priority': task.priority,
+                'color': vehicle.color,
+                'start': VehicleState(x=start_x, y=start_y, theta=theta, v=3.0, t=0.0),
+                'goal': VehicleState(x=end_x, y=end_y, theta=theta, v=2.0, t=0.0),
+                'description': f'Vehicle {vehicle.vehicle_id} ({task.start_edge.edge_id}->{task.end_edge.edge_id})'
+            }
+            scenarios.append(scenario)
+        
+        return scenarios
+    
+    def _convert_gnn_results_back(self, gnn_results: Dict) -> int:
+        """将GNN结果转换回原格式"""
+        success_count = 0
+        
+        for vehicle in self.vehicles:
+            vehicle_id = vehicle.vehicle_id
+            
+            if vehicle_id in gnn_results and gnn_results[vehicle_id]['trajectory']:
+                vehicle.trajectory = gnn_results[vehicle_id]['trajectory']
+                vehicle.planning_time = gnn_results[vehicle_id].get('planning_time', 0.0)
+                success_count += 1
+            else:
+                vehicle.trajectory = None
+                vehicle.planning_time = 0.0
+        
+        return success_count
+    
+    def create_advanced_visualization(self):
+        """创建高级可视化"""
+        
+        if not HAS_ADVANCED_VISUALIZATION or not self.gnn_coordinator:
+            print("🎬 使用简单可视化")
+            visualizer = SimpleVisualizer(self)
+            return visualizer.create_animation()
+        
+        print("🎬 创建GNN增强可视化")
+        
+        try:
+            # 转换为高级可视化需要的格式
+            results = {}
+            scenarios = []
+            
+            for vehicle in self.vehicles:
+                if vehicle.trajectory:
+                    results[vehicle.vehicle_id] = {
+                        'trajectory': vehicle.trajectory,
+                        'color': vehicle.color,
+                        'description': f'Vehicle {vehicle.vehicle_id} ({vehicle.task.start_edge.edge_id}->{vehicle.task.end_edge.edge_id})',
+                        'planning_time': vehicle.planning_time
+                    }
+                    
+                    scenarios.append({
+                        'id': vehicle.vehicle_id,
+                        'priority': vehicle.task.priority,
+                        'color': vehicle.color,
+                        'description': f'Vehicle {vehicle.vehicle_id} ({vehicle.task.start_edge.edge_id}->{vehicle.task.end_edge.edge_id})'
+                    })
+            
+            if results:
+                # 使用trying.py的高级可视化
+                coordinator = MultiVehicleCoordinator(
+                    optimization_level=self.optimization_level
+                )
+                coordinator.environment = self.environment
+                return coordinator.create_animation(results, scenarios)
+            else:
+                print("❌ 没有成功轨迹可显示")
+                return None
+                
+        except Exception as e:
+            print(f"⚠️ 高级可视化失败: {str(e)}")
+            print("🔄 回退到简单可视化")
+            visualizer = SimpleVisualizer(self)
+            return visualizer.create_animation()
+
+class SimpleVisualizer:
+    """简单可视化器"""
+    
+    def __init__(self, planner: FirstRoundPlanner):
         self.planner = planner
-        self.fig, (self.ax_map, self.ax_stats) = plt.subplots(1, 2, figsize=(18, 9))
+        self.fig, (self.ax_map, self.ax_stats) = plt.subplots(1, 2, figsize=(16, 8))
     
     def create_animation(self):
-        """创建增强版动画，显示GAT协调信息"""
+        """创建动画"""
         successful_vehicles = self.planner.get_successful_vehicles()
         
         if not successful_vehicles:
@@ -604,19 +673,13 @@ class EnhancedVisualizer:
             # 绘制环境
             self._draw_environment()
             
-            # 绘制车辆和GAT信息
+            # 绘制车辆
             active_count = 0
-            gat_info_text = []
-            
             for vehicle in successful_vehicles:
                 current_state = self._get_state_at_time(vehicle.trajectory, current_time)
                 if current_state:
-                    self._draw_vehicle_with_gat_info(current_state, vehicle)
+                    self._draw_vehicle(current_state, vehicle.color)
                     active_count += 1
-                    
-                    # 收集GAT信息
-                    if self.planner.enable_gat and vehicle.gat_guidance:
-                        gat_info_text.append(f"V{vehicle.vehicle_id}:{vehicle.gat_guidance.strategy}")
                 
                 # 绘制轨迹
                 xs = [s.x for s in vehicle.trajectory]
@@ -626,25 +689,14 @@ class EnhancedVisualizer:
             # 绘制任务起终点
             self._draw_tasks()
             
-            # 🆕 标题包含GAT信息
-            gat_status = "🧠GAT协调" if self.planner.enable_gat else "传统规划"
-            title = f'增强版第一轮多车规划 - {self.planner.environment.map_name}\n'
-            title += f'{gat_status} | 时间: {current_time:.1f}s | 活跃车辆: {active_count}'
-            
-            self.ax_map.set_title(title)
+            self.ax_map.set_title(f'终身路口规划 - {self.planner.environment.map_name}\n'
+                                 f'时间: {current_time:.1f}s | 活跃车辆: {active_count}')
             self.ax_map.set_xlim(0, self.planner.environment.size)
             self.ax_map.set_ylim(0, self.planner.environment.size)
             self.ax_map.grid(True, alpha=0.3)
             
-            # 🆕 显示GAT策略信息
-            if gat_info_text:
-                gat_text = " | ".join(gat_info_text)
-                self.ax_map.text(0.02, 0.02, f"GAT策略: {gat_text}", 
-                               transform=self.ax_map.transAxes, fontsize=8,
-                               bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.7))
-            
-            # 增强统计图
-            self._draw_enhanced_statistics()
+            # 统计图
+            self._draw_statistics()
             
             return []
         
@@ -655,8 +707,7 @@ class EnhancedVisualizer:
         # 保存GIF
         try:
             writer = PillowWriter(fps=5)
-            gat_suffix = "_gat" if self.planner.enable_gat else "_traditional"
-            gif_filename = f"enhanced_first_round_{self.planner.environment.map_name}{gat_suffix}.gif"
+            gif_filename = f"lifelong_gnn_{self.planner.environment.map_name}.gif"
             anim.save(gif_filename, writer=writer)
             print(f"✅ 动画已保存: {gif_filename}")
         except Exception as e:
@@ -665,45 +716,6 @@ class EnhancedVisualizer:
         plt.tight_layout()
         plt.show()
         return anim
-    
-    def _draw_vehicle_with_gat_info(self, state: VehicleState, vehicle: Vehicle):
-        """绘制带GAT信息的车辆"""
-        # 绘制基础车辆
-        self._draw_vehicle(state, vehicle.color)
-        
-        # 🆕 GAT信息显示
-        if self.planner.enable_gat and vehicle.gat_guidance:
-            guidance = vehicle.gat_guidance
-            
-            # 根据策略调整车辆边框样式
-            linewidth = 2
-            linestyle = '-'
-            
-            if guidance.strategy == "cooperative":
-                linewidth = 3
-                # 绘制合作指示
-                self.ax_map.plot(state.x, state.y, 'o', color='green', 
-                               markersize=6, alpha=0.7)
-            elif guidance.strategy == "aggressive":
-                linestyle = '--'
-                linewidth = 3
-            elif guidance.strategy == "defensive":
-                # 绘制防御圈
-                circle = plt.Circle((state.x, state.y), radius=2.0, 
-                                  fill=False, color='orange', alpha=0.5)
-                self.ax_map.add_patch(circle)
-            elif guidance.strategy == "adaptive":
-                linewidth = 2
-                # 绘制适应性标记
-                self.ax_map.plot(state.x, state.y, '^', color='purple', 
-                               markersize=6, alpha=0.7)
-            
-            # 显示优先级调整
-            if abs(guidance.priority_adjustment) > 0.1:
-                priority_color = 'red' if guidance.priority_adjustment > 0 else 'blue'
-                self.ax_map.text(state.x + 1, state.y + 1, 
-                               f"{guidance.priority_adjustment:+.1f}", 
-                               fontsize=8, color=priority_color, weight='bold')
     
     def _draw_environment(self):
         """绘制环境"""
@@ -762,54 +774,27 @@ class EnhancedVisualizer:
             start_x, start_y = task.start_pos
             end_x, end_y = task.end_pos
             
-            # 起点
-            self.ax_map.plot(start_x, start_y, 'go', markersize=6)
-            # 终点
-            self.ax_map.plot(end_x, end_y, 'rs', markersize=6)
+            # 起点 (绿色圆圈)
+            self.ax_map.plot(start_x, start_y, 'go', markersize=6, markeredgecolor='darkgreen')
+            # 终点 (红色方形)
+            self.ax_map.plot(end_x, end_y, 'rs', markersize=6, markeredgecolor='darkred')
             # 连线
             self.ax_map.plot([start_x, end_x], [start_y, end_y], 
                            'k--', alpha=0.3, linewidth=1)
     
-    def _draw_enhanced_statistics(self):
-        """🆕 绘制增强统计信息（包含GAT信息）"""
+    def _draw_statistics(self):
+        """绘制统计信息"""
         total = self.planner.total_vehicles
         successful = self.planner.successful_plannings
         success_rate = (successful / total) * 100 if total > 0 else 0
         
-        # 基础饼图
         labels = ['成功', '失败']
         sizes = [successful, total - successful]
         colors = ['lightgreen', 'lightcoral']
         
-        wedges, texts, autotexts = self.ax_stats.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%')
-        
-        # 🆕 GAT统计信息
-        if self.planner.enable_gat:
-            gat_text = f"GAT增强规划\n成功率: {success_rate:.1f}%\n"
-            
-            # 策略分布
-            successful_vehicles = self.planner.get_successful_vehicles()
-            strategy_count = {}
-            for vehicle in successful_vehicles:
-                if vehicle.gat_guidance:
-                    strategy = vehicle.gat_guidance.strategy
-                    strategy_count[strategy] = strategy_count.get(strategy, 0) + 1
-            
-            if strategy_count:
-                gat_text += "策略分布:\n"
-                for strategy, count in strategy_count.items():
-                    gat_text += f"{strategy}: {count}\n"
-            
-            # GAT性能
-            total_gat_time = (self.planner.gat_stats['graph_construction_time'] + 
-                             self.planner.gat_stats['inference_time'] + 
-                             self.planner.gat_stats['decision_parsing_time'])
-            gat_text += f"GAT耗时: {total_gat_time:.3f}s"
-            
-        else:
-            gat_text = f"传统规划\n成功率: {success_rate:.1f}%"
-        
-        self.ax_stats.set_title(gat_text)
+        if sum(sizes) > 0:
+            self.ax_stats.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%')
+        self.ax_stats.set_title(f'规划结果统计\n成功率: {success_rate:.1f}%')
     
     def _get_state_at_time(self, trajectory: List[VehicleState], target_time: float) -> Optional[VehicleState]:
         """获取指定时间的状态"""
@@ -842,9 +827,10 @@ class EnhancedVisualizer:
 
 def main():
     """主函数"""
-    print("🚀 增强版第一轮多车轨迹规划系统")
-    print("🧠 集成GAT智能协调 + 传统规划器")
-    print("=" * 60)
+    print("🧠 终身GNN路口规划系统")
+    print("🎯 每条出入口边一个任务：边上随机整数起点 → 非相邻边随机整数终点")
+    print("🚀 可选GNN增强 + 智能优先级 + 高级可视化")
+    print("=" * 70)
     
     # 查找地图文件
     import os
@@ -853,7 +839,8 @@ def main():
                 for keyword in ['lifelong', 'intersection', 'cross', 'junction'])]
     
     if not map_files:
-        print("❌ 未找到地图文件，请使用 lifelong_map.py 创建")
+        print("❌ 未找到路口地图文件")
+        print("💡 请使用 lifelong_map.py 创建路口地图")
         return
     
     print(f"📁 发现 {len(map_files)} 个地图文件:")
@@ -873,48 +860,69 @@ def main():
         except:
             selected_map = map_files[0]
     
-    print(f"🎯 使用地图: {selected_map}")
+    print(f"🗺️ 使用地图: {selected_map}")
+    
+    # 选择规划模式
+    print(f"\n🎯 选择规划模式:")
+    print(f"   1. GNN增强模式 (推荐)")
+    print(f"   2. 基础规划模式")
+    
+    mode_choice = input("选择模式 (1/2) 或回车使用GNN模式: ").strip()
+    use_gnn = mode_choice != '2'
     
     # 选择优化级别
+    print(f"\n⚙️ 选择优化级别:")
+    print(f"   1. BASIC (快速)")
+    print(f"   2. ENHANCED (平衡)")
+    print(f"   3. FULL (完整，推荐)")
+    
+    opt_choice = input("选择优化级别 (1/2/3) 或回车使用FULL: ").strip()
     opt_levels = {
         '1': OptimizationLevel.BASIC,
         '2': OptimizationLevel.ENHANCED, 
         '3': OptimizationLevel.FULL
     }
-    
-    choice = input("优化级别 (1=BASIC, 2=ENHANCED, 3=FULL) 或回车使用ENHANCED: ").strip()
-    opt_level = opt_levels.get(choice, OptimizationLevel.ENHANCED)
-    
-    # 🆕 GAT选项
-    gat_choice = input("启用GAT智能协调? (y/N) 或回车使用默认: ").strip().lower()
-    enable_gat = gat_choice in ['y', 'yes'] if gat_choice else HAS_GAT
-    
-    print(f"🎯 优化级别: {opt_level.value}")
-    print(f"🧠 GAT智能协调: {'✅ 启用' if enable_gat else '❌ 禁用'}")
+    opt_level = opt_levels.get(opt_choice, OptimizationLevel.FULL)
     
     try:
-        # 创建增强规划器
-        planner = EnhancedFirstRoundPlanner(selected_map, opt_level, enable_gat)
+        # 创建规划器
+        if use_gnn:
+            planner = LifelongGNNPlanner(selected_map, opt_level, use_gnn=True)
+        else:
+            planner = FirstRoundPlanner(selected_map, opt_level)
+        
+        # 分析冲突强度
+        conflict_analysis = ConflictIntensityAnalyzer.analyze_scenario_conflicts(planner.vehicles)
+        print(f"\n📊 场景分析:")
+        print(f"   车辆数量: {len(planner.vehicles)}")
+        print(f"   冲突强度: {conflict_analysis['intensity']:.3f}")
+        print(f"   冲突对数: {conflict_analysis['conflict_count']}/{conflict_analysis['total_pairs']}")
         
         # 应用智能优先级（如果可用）
         planner.apply_intelligent_priorities()
         
-        # 🆕 应用GAT智能协调
-        planner.apply_gat_coordination()
-        
         # 执行规划
-        success = planner.plan_all_vehicles()
+        print(f"\n🚀 开始{'GNN增强' if use_gnn else '基础'}规划...")
         
-        # 🆕 打印详细结果
-        planner.print_detailed_results()
-        
-        if success:
-            # 创建增强可视化
-            visualizer = EnhancedVisualizer(planner)
-            visualizer.create_animation()
-            print("🎉 增强版第一轮规划完成！")
+        if use_gnn and isinstance(planner, LifelongGNNPlanner):
+            success = planner.plan_all_vehicles_with_gnn()
         else:
-            print("⚠️ 规划成功率较低")
+            success = planner.plan_all_vehicles()
+        
+        # 创建可视化
+        if success:
+            print(f"\n🎬 创建可视化...")
+            if use_gnn and isinstance(planner, LifelongGNNPlanner):
+                planner.create_advanced_visualization()
+            else:
+                visualizer = SimpleVisualizer(planner)
+                visualizer.create_animation()
+            
+            print(f"🎉 终身GNN路口规划完成！")
+        else:
+            print(f"⚠️ 规划成功率较低，仍会显示结果")
+            visualizer = SimpleVisualizer(planner)
+            visualizer.create_animation()
             
     except Exception as e:
         print(f"❌ 运行失败: {str(e)}")

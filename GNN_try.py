@@ -17,7 +17,8 @@ from dataclasses import dataclass
 from enum import Enum
 import os
 import json
-
+# 🔧 正确的导入方式（使用别名）
+from Pretraining_gnn import SafetyEnhancedTrainingConfig as TrainingConfig
 # 导入原有组件
 from trying import (
     VehicleState, VehicleParameters, UnstructuredEnvironment, 
@@ -96,7 +97,7 @@ class PretrainedGNNLoader:
         try:
             print(f"📥 尝试加载预训练GNN模型: {model_path}")
             
-            checkpoint = torch.load(model_path, map_location='cpu')
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
             config = checkpoint.get('config')
             
             if config is None:
@@ -304,7 +305,7 @@ class EnhancedVehicleGraphBuilder:
     def __init__(self, params: VehicleParameters):
         self.params = params
         self.interaction_radius = 50.0
-        self.node_feature_dim = 10      
+        self.node_feature_dim = 18      
         self.edge_feature_dim = 6       
         self.global_feature_dim = 8
         
@@ -351,7 +352,7 @@ class EnhancedVehicleGraphBuilder:
         )
     
     def _extract_enhanced_node_features(self, vehicles_info: List[Dict]) -> List[List[float]]:
-        """🆕 提取增强节点特征（更丰富的特征）"""
+        """🆕 提取增强节点特征（调整为8维匹配预训练模型）"""
         node_features = []
         
         for vehicle_info in vehicles_info:
@@ -364,33 +365,17 @@ class EnhancedVehicleGraphBuilder:
             dy = goal_state.y - current_state.y
             distance_to_goal = math.sqrt(dx*dx + dy*dy)
             goal_bearing = math.atan2(dy, dx)
-            heading_error = self._normalize_angle(current_state.theta - goal_bearing)
             
-            # 运动特征
-            speed_ratio = current_state.v / self.params.max_speed
-            acceleration = getattr(current_state, 'acceleration', 0.0) / self.params.max_accel
-            
-            # 🆕 增强特征
-            # 角速度（基于历史状态估算）
-            angular_velocity = 0.0  # 简化实现
-            
-            # 相对于环境中心的位置
-            env_center_x, env_center_y = 50.0, 50.0  # 假设100x100环境
-            relative_x = (current_state.x - env_center_x) / 50.0
-            relative_y = (current_state.y - env_center_y) / 50.0
-            
-            # 增强的10维特征向量
+            # 🔧 调整为8维特征向量（去掉angular_velocity和relative_y）
             features = [
-                relative_x,                              # [0] 相对环境中心x
-                relative_y,                              # [1] 相对环境中心y
-                math.cos(current_state.theta),          # [2] 航向余弦
-                math.sin(current_state.theta),          # [3] 航向正弦
-                speed_ratio,                             # [4] 归一化速度
-                acceleration,                            # [5] 归一化加速度
-                distance_to_goal / 100.0,               # [6] 归一化目标距离
-                math.cos(goal_bearing),                  # [7] 目标方向余弦
-                math.sin(goal_bearing),                  # [8] 目标方向正弦
-                priority / 10.0                         # [9] 归一化优先级
+                (current_state.x - 50.0) / 50.0,    # [0] 相对环境中心x
+                math.cos(current_state.theta),      # [1] 航向余弦
+                math.sin(current_state.theta),      # [2] 航向正弦
+                current_state.v / self.params.max_speed,  # [3] 归一化速度
+                getattr(current_state, 'acceleration', 0.0) / self.params.max_accel,  # [4] 归一化加速度
+                distance_to_goal / 100.0,           # [5] 归一化目标距离
+                math.cos(goal_bearing),             # [6] 目标方向余弦
+                priority / 10.0                     # [7] 归一化优先级
             ]
             
             node_features.append(features)

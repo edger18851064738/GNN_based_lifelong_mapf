@@ -1,1096 +1,1107 @@
 #!/usr/bin/env python3
 """
-🚀 Advanced GNN Framework for Multi-Vehicle Path Planning - 完整修复版本
-作者: 集成trying.py和trans.py的最新GNN架构 + 维度错误修复
+🛡️ 路口GNN预训练系统 - 支持intersection_edges格式
+专门为lifelong_planning.py的路口场景设计
 
-使用方法:
-1. 将此文件保存为 train.py
-2. 确保trying.py和trans.py在同目录下
-3. 运行: python train.py
-
-核心优势:
-✅ 保持trying.py完全不变（240s→3s优化保持不变）
-✅ 升级GNN为2020-2025顶级期刊水平  
-✅ 修复所有维度不匹配问题
-✅ 自动处理依赖，优雅降级
-✅ 即插即用，最小修改量
-✅ 基于最新MAPF+GNN文献优化
+主要特性:
+✅ 支持intersection_edges地图格式
+✅ 生成路口冲突激烈场景
+✅ 每条边一个任务的训练数据
+✅ 安全感知的路口标签生成
+✅ 兼容lifelong_planning.py的特征维度
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+import torch_geometric.nn as pyg_nn
+from torch_geometric.data import Data, DataLoader, Batch
+from torch.utils.data import Dataset
 import numpy as np
-import time
+import math
 import json
 import os
-import sys
-import traceback
-import warnings
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 from dataclasses import dataclass
-from enum import Enum
+import time
+from tqdm import tqdm
+import random
 
-# 忽略警告
-warnings.filterwarnings("ignore")
-
-# =============================================================================
-# 🔄 依赖管理和自动导入
-# =============================================================================
-
-print("🔄 Auto-importing trying.py modules...")
+# 导入基础组件
 try:
-    from trying import (
-        VehicleState, VehicleParameters, UnstructuredEnvironment,
-        VHybridAStarPlanner, MultiVehicleCoordinator, OptimizationLevel,
-        HybridNode, ConflictDensityAnalyzer, TimeSync,
-        OptimizedTrajectoryProcessor, CompleteQPOptimizer, 
-        EnhancedConvexSpaceSTDiagram, PreciseKinematicModel,
-        interactive_json_selection, save_trajectories
-    )
-    print("✅ Successfully imported trying.py - using mature algorithms")
+    from trying import UnstructuredEnvironment, VehicleState, VehicleParameters
     HAS_TRYING = True
-except ImportError as e:
-    print(f"⚠️ trying.py not found: {e}")
-    print("🔧 Using fallback implementations")
-    HAS_TRYING = False
-
-print("🔄 Auto-importing trans.py modules...")
-try:
-    from trans import (
-        VehicleGraphBuilder, VehicleInteractionGraph,
-        GNNEnhancementLevel
-    )
-    print("✅ Successfully imported trans.py - using graph building logic")
-    HAS_TRANS = True
-except ImportError as e:
-    print(f"⚠️ trans.py not found: {e}")
-    print("🔧 Using fallback graph builder")
-    HAS_TRANS = False
-
-# 🔄 可选PyTorch Geometric
-try:
-    from torch_geometric.nn import GCNConv, GATConv, global_mean_pool
-    HAS_TORCH_GEOMETRIC = True
-    print("✅ PyTorch Geometric available")
+    print("✅ 成功导入trying.py环境组件")
 except ImportError:
-    HAS_TORCH_GEOMETRIC = False
-    print("⚠️ PyTorch Geometric not found - using pure PyTorch")
-
-# =============================================================================
-# 📚 Fallback数据结构（当依赖不可用时）
-# =============================================================================
-
-if not HAS_TRYING:
+    HAS_TRYING = False
+    print("⚠️ 无法导入trying.py，将使用简化实现")
+    
     @dataclass
     class VehicleState:
-        x: float; y: float; theta: float; v: float; t: float
-        steer: float = 0.0; acceleration: float = 0.0
-        def copy(self): return VehicleState(self.x, self.y, self.theta, self.v, self.t, self.steer, self.acceleration)
+        x: float
+        y: float
+        theta: float
+        v: float
+        t: float
     
     class VehicleParameters:
         def __init__(self):
-            self.wheelbase = 2.1; self.length = 2.8; self.width = 1.6
-            self.max_speed = 6.0; self.min_speed = 0.3; self.dt = 0.4
+            self.max_speed = 8.0
             self.max_accel = 2.0
+            self.length = 4.0
+            self.width = 2.0
     
-    class OptimizationLevel(Enum):
-        BASIC = "basic"; ENHANCED = "enhanced"; FULL = "full"
+    class UnstructuredEnvironment:
+        def __init__(self, size=100):
+            self.size = size
+            self.obstacle_map = np.zeros((size, size), dtype=bool)
+        
+        def is_valid_position(self, x, y):
+            ix, iy = int(round(x)), int(round(y))
+            if 0 <= ix < self.size and 0 <= iy < self.size:
+                return not self.obstacle_map[iy, ix]
+            return False
 
-if not HAS_TRANS:
+# 导入lifelong组件
+try:
+    from lifelong_planning import IntersectionEdge, Task, Vehicle
+    HAS_LIFELONG = True
+    print("✅ 成功导入lifelong_planning.py组件")
+except ImportError:
+    HAS_LIFELONG = False
+    print("⚠️ 将使用内置路口组件")
+    
     @dataclass
-    class VehicleInteractionGraph:
-        node_features: torch.Tensor; edge_indices: torch.Tensor; edge_features: torch.Tensor
-        vehicle_ids: List[int]; adjacency_matrix: torch.Tensor; global_features: torch.Tensor
+    class IntersectionEdge:
+        edge_id: str
+        center_x: int
+        center_y: int
+        length: int = 5
+        direction: str = ""
+        
+        def get_random_integer_position(self) -> Tuple[int, int]:
+            return (self.center_x, self.center_y)
     
-    class GNNEnhancementLevel(Enum):
-        PRIORITY_ONLY = "priority_only"; EXPANSION_GUIDE = "expansion_guide"; FULL_INTEGRATION = "full_integration"
-
-# =============================================================================
-# 🔧 修复版本：SpatioTemporalPositionalEncoding
-# =============================================================================
-
-class SpatioTemporalPositionalEncoding(nn.Module):
-    """📍 修复的时空位置编码 - 解决维度拼接问题"""
+    @dataclass
+    class Task:
+        task_id: int
+        start_edge: IntersectionEdge
+        end_edge: IntersectionEdge
+        start_pos: Tuple[int, int]
+        end_pos: Tuple[int, int]
+        priority: int = 1
     
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        
-        # 🔧 修复：确保输出维度正确分配
-        quarter_dim = max(1, hidden_dim // 4)
-        
-        self.spatial_proj = nn.Linear(2, quarter_dim)      # x, y
-        self.angle_proj = nn.Linear(2, quarter_dim)        # cos, sin θ
-        self.velocity_proj = nn.Linear(1, quarter_dim)     # v
-        self.time_proj = nn.Linear(1, quarter_dim)         # t
-        
-        # 🔧 修复：正确的融合层维度
-        total_input_dim = quarter_dim * 4
-        self.fusion = nn.Linear(total_input_dim, hidden_dim)
-        
-        print(f"         ✅ 位置编码修复: 输入维度 {total_input_dim} -> 输出维度 {hidden_dim}")
+    @dataclass
+    class Vehicle:
+        vehicle_id: int
+        task: Task
+        trajectory: List[VehicleState] = None
+        color: str = "blue"
 
-    def forward(self, x, raw_features):
-        if raw_features.shape[1] < 5:
-            return x
-            
-        try:
-            batch_size = raw_features.shape[0]
-            device = raw_features.device
-            
-            # 🔧 安全的特征提取
-            spatial_features = raw_features[:, 0:2]  # x, y
-            
-            # 角度特征处理
-            if raw_features.shape[1] >= 3:
-                theta = raw_features[:, 2]
-                angle_features = torch.stack([torch.cos(theta), torch.sin(theta)], dim=1)
-            else:
-                angle_features = torch.zeros(batch_size, 2, device=device)
-            
-            # 速度特征
-            if raw_features.shape[1] >= 5:
-                velocity_features = raw_features[:, 4:5]
-            else:
-                velocity_features = torch.ones(batch_size, 1, device=device)
-            
-            # 时间特征
-            if raw_features.shape[1] >= 10:
-                time_features = raw_features[:, -1:]
-            else:
-                time_features = torch.zeros(batch_size, 1, device=device)
-            
-            # 分别投影
-            spatial_proj = self.spatial_proj(spatial_features)
-            angle_proj = self.angle_proj(angle_features)
-            velocity_proj = self.velocity_proj(velocity_features)
-            time_proj = self.time_proj(time_features)
-            
-            # 拼接并融合
-            pos_enc_concat = torch.cat([spatial_proj, angle_proj, velocity_proj, time_proj], dim=-1)
-            pos_enc = self.fusion(pos_enc_concat)
-            
-            return x + pos_enc
-            
-        except Exception as e:
-            print(f"        ⚠️ 位置编码失败: {e}，跳过位置编码")
-            return x
-
-# =============================================================================
-# 🔧 修复版本：GraphTransformerLayer
-# =============================================================================
-
-class GraphTransformerLayer(nn.Module):
-    """🔧 修复的Graph Transformer Layer - GPS风格"""
+@dataclass
+class IntersectionTrainingConfig:
+    """🛡️ 路口训练配置"""
+    batch_size: int = 4
+    learning_rate: float = 0.0008
+    num_epochs: int = 40
+    hidden_dim: int = 64
+    num_layers: int = 3
+    dropout: float = 0.15
+    weight_decay: float = 1e-4
     
-    def __init__(self, hidden_dim, num_heads, dropout=0.1):
-        super().__init__()
+    # 🆕 路口场景配置
+    num_scenarios: int = 2000
+    num_map_variants: int = 8
+    max_vehicles_per_scenario: int = 8
+    min_vehicles_per_scenario: int = 3
+    
+    # 🛡️ 安全相关配置
+    min_safe_distance: float = 8.0
+    safety_priority_weight: float = 1.8  # 路口安全权重更高
+    high_conflict_ratio: float = 0.4     # 40%高冲突场景
+    
+    # 验证配置
+    val_split: float = 0.2
+    early_stopping_patience: int = 10
+
+class IntersectionMapGenerator:
+    """路口地图生成器"""
+    
+    def __init__(self, config: IntersectionTrainingConfig):
+        self.config = config
+        self.real_maps = []
+        self.synthetic_maps = []
         
-        # 🔧 确保 hidden_dim 能被 num_heads 整除
-        if hidden_dim % num_heads != 0:
-            adjusted_hidden_dim = ((hidden_dim + num_heads - 1) // num_heads) * num_heads
-            print(f"         🔧 GraphTransformerLayer: 调整 hidden_dim {hidden_dim} → {adjusted_hidden_dim}")
-            hidden_dim = adjusted_hidden_dim
-            
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
+        print("🗺️ 初始化路口地图生成器...")
+        self._scan_intersection_maps()
+        self._generate_synthetic_intersection_maps()
+    
+    def _scan_intersection_maps(self):
+        """扫描真实路口地图"""
+        print("🔍 扫描路口地图文件...")
         
-        # Multi-head attention
-        self.attention = nn.MultiheadAttention(
-            hidden_dim, num_heads, dropout=dropout, batch_first=True
-        )
+        json_files = [f for f in os.listdir('.') if f.endswith('.json')]
+        intersection_files = [f for f in json_files if any(keyword in f.lower() 
+                            for keyword in ['lifelong', 'intersection', 'cross', 'junction'])]
         
-        # FFN
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 4, hidden_dim), nn.Dropout(dropout)
-        )
-        
-        # Layer norms
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        
-        # 局部GNN（如果可用）
-        if HAS_TORCH_GEOMETRIC:
+        for json_file in intersection_files:
             try:
-                self.local_gnn = GATConv(hidden_dim, hidden_dim, heads=1, concat=False)
-            except:
-                pass
-
-    def forward(self, x, edge_index, edge_attr):
-        if x.shape[0] == 0:
-            return x, edge_attr, None
-            
-        try:
-            residual = x
-            
-            # 局部GNN处理（如果可用）
-            if hasattr(self, 'local_gnn') and edge_index.shape[1] > 0:
-                try:
-                    x_local = self.local_gnn(x, edge_index)
-                    x = self.norm1(x_local + residual)
-                except:
-                    pass
-            
-            # 🔧 安全的全局注意力
-            if x.shape[0] == 1:
-                # 单节点情况：跳过注意力机制
-                attn_weights = torch.ones(1, 1, 1, device=x.device)
-                x_global = x
-            else:
-                # 多节点情况：应用注意力
-                x_seq = x.unsqueeze(0)  # [1, N, hidden_dim]
-                try:
-                    attn_out, attn_weights = self.attention(x_seq, x_seq, x_seq)
-                    x_global = attn_out.squeeze(0)
-                except Exception as e:
-                    print(f"        ⚠️ 注意力计算失败: {e}")
-                    x_global = x
-                    attn_weights = None
-            
-            x = self.norm1(x_global + x)
-            
-            # FFN
-            x_ffn = self.ffn(x)
-            x = self.norm2(x + x_ffn)
-            
-            return x, edge_attr, attn_weights
-            
-        except Exception as e:
-            print(f"        ⚠️ GraphTransformer层失败: {e}")
-            return x, edge_attr, None
-
-# =============================================================================
-# 🔧 修复版本：SpatioTemporalGraphTransformer
-# =============================================================================
-
-class SpatioTemporalGraphTransformer(nn.Module):
-    """🧠 修复的时空图Transformer - SOTA 2024架构"""
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    map_data = json.load(f)
+                
+                # 验证是否为路口地图
+                if 'intersection_edges' in map_data and map_data['intersection_edges']:
+                    env = UnstructuredEnvironment(size=100)
+                    if hasattr(env, 'load_from_json'):
+                        success = env.load_from_json(json_file)
+                        if success:
+                            self.real_maps.append({
+                                'name': json_file,
+                                'environment': env,
+                                'data': map_data
+                            })
+                            print(f"  ✅ 加载路口地图: {json_file}")
+                    
+            except Exception as e:
+                continue
+        
+        print(f"📊 发现 {len(self.real_maps)} 个路口地图文件")
     
-    def __init__(self, node_dim=10, edge_dim=6, hidden_dim=128, num_heads=8, num_layers=4, dropout=0.1):
+    def _generate_synthetic_intersection_maps(self):
+        """生成合成路口地图"""
+        print(f"🏗️ 生成 {self.config.num_map_variants} 种合成路口地图...")
+        
+        for i in range(self.config.num_map_variants):
+            map_data = self._create_synthetic_intersection(i)
+            env = UnstructuredEnvironment(size=100)
+            
+            # 设置障碍物
+            if 'grid' in map_data:
+                grid = np.array(map_data['grid'])
+                for row in range(min(grid.shape[0], env.size)):
+                    for col in range(min(grid.shape[1], env.size)):
+                        if grid[row, col] == 1:
+                            env.obstacle_map[row, col] = True
+            
+            self.synthetic_maps.append({
+                'name': f"synthetic_intersection_{i}",
+                'environment': env,
+                'data': map_data
+            })
+        
+        print(f"✅ 生成了 {len(self.synthetic_maps)} 个合成路口地图")
+    
+    def _create_synthetic_intersection(self, variant_id: int) -> Dict:
+        """创建合成路口地图"""
+        # 基于variant_id创建不同类型的路口
+        intersection_types = ['four_way', 'three_way', 'complex', 'roundabout']
+        intersection_type = intersection_types[variant_id % len(intersection_types)]
+        
+        # 基础地图信息
+        map_data = {
+            "map_info": {
+                "name": f"synthetic_intersection_{variant_id}",
+                "width": 100,
+                "height": 100,
+                "type": intersection_type
+            },
+            "intersection_edges": [],
+            "grid": np.zeros((100, 100), dtype=int).tolist()
+        }
+        
+        if intersection_type == 'four_way':
+            # 四向路口
+            edges = [
+                {"edge_id": "N", "center_x": 50, "center_y": 10, "direction": "north", "length": 8},
+                {"edge_id": "S", "center_x": 50, "center_y": 90, "direction": "south", "length": 8},
+                {"edge_id": "E", "center_x": 90, "center_y": 50, "direction": "east", "length": 8},
+                {"edge_id": "W", "center_x": 10, "center_y": 50, "direction": "west", "length": 8}
+            ]
+            # 添加中央障碍物
+            for x in range(45, 56):
+                for y in range(45, 56):
+                    map_data["grid"][y][x] = 1
+                    
+        elif intersection_type == 'three_way':
+            # T型路口
+            edges = [
+                {"edge_id": "N", "center_x": 50, "center_y": 15, "direction": "north", "length": 10},
+                {"edge_id": "E", "center_x": 85, "center_y": 50, "direction": "east", "length": 10},
+                {"edge_id": "W", "center_x": 15, "center_y": 50, "direction": "west", "length": 10}
+            ]
+            # 添加障碍物
+            for x in range(40, 61):
+                for y in range(60, 80):
+                    map_data["grid"][y][x] = 1
+                    
+        elif intersection_type == 'complex':
+            # 复杂路口
+            edges = [
+                {"edge_id": "N1", "center_x": 40, "center_y": 10, "direction": "north", "length": 6},
+                {"edge_id": "N2", "center_x": 60, "center_y": 10, "direction": "north", "length": 6},
+                {"edge_id": "S", "center_x": 50, "center_y": 90, "direction": "south", "length": 8},
+                {"edge_id": "E", "center_x": 90, "center_y": 50, "direction": "east", "length": 8},
+                {"edge_id": "W", "center_x": 10, "center_y": 50, "direction": "west", "length": 8}
+            ]
+            # 复杂障碍物布局
+            for x in range(30, 35):
+                for y in range(30, 70):
+                    map_data["grid"][y][x] = 1
+            for x in range(65, 70):
+                for y in range(30, 70):
+                    map_data["grid"][y][x] = 1
+                    
+        else:  # roundabout
+            # 环岛
+            edges = [
+                {"edge_id": "N", "center_x": 50, "center_y": 20, "direction": "north", "length": 6},
+                {"edge_id": "S", "center_x": 50, "center_y": 80, "direction": "south", "length": 6},
+                {"edge_id": "E", "center_x": 80, "center_y": 50, "direction": "east", "length": 6},
+                {"edge_id": "W", "center_x": 20, "center_y": 50, "direction": "west", "length": 6}
+            ]
+            # 中央圆形障碍物
+            center_x, center_y = 50, 50
+            radius = 12
+            for x in range(100):
+                for y in range(100):
+                    if (x - center_x)**2 + (y - center_y)**2 <= radius**2:
+                        map_data["grid"][y][x] = 1
+        
+        map_data["intersection_edges"] = edges
+        return map_data
+    
+    def get_random_intersection_map(self) -> Tuple[UnstructuredEnvironment, Dict, str]:
+        """获取随机路口地图"""
+        all_maps = self.real_maps + self.synthetic_maps
+        
+        if not all_maps:
+            # 创建最简单的默认路口
+            default_map = self._create_synthetic_intersection(0)
+            env = UnstructuredEnvironment(size=100)
+            return env, default_map, "default_intersection"
+        
+        selected = random.choice(all_maps)
+        return selected['environment'], selected['data'], selected['name']
+
+class IntersectionVehicleScenarioGenerator:
+    """路口车辆场景生成器"""
+    
+    def __init__(self, config: IntersectionTrainingConfig):
+        self.config = config
+        self.map_generator = IntersectionMapGenerator(config)
+        
+    def generate_training_data(self) -> List[Tuple]:
+        """生成路口训练数据"""
+        print(f"🛡️ 生成 {self.config.num_scenarios} 个路口训练场景...")
+        
+        data_list = []
+        failed_scenarios = 0
+        
+        # 分配高冲突和普通场景
+        num_high_conflict = int(self.config.num_scenarios * self.config.high_conflict_ratio)
+        num_normal = self.config.num_scenarios - num_high_conflict
+        
+        print(f"📊 场景分配: {num_high_conflict} 高冲突 + {num_normal} 普通场景")
+        
+        for i in tqdm(range(self.config.num_scenarios)):
+            try:
+                # 获取随机路口地图
+                environment, map_data, map_name = self.map_generator.get_random_intersection_map()
+                
+                # 生成车辆场景
+                is_high_conflict = i < num_high_conflict
+                vehicles = self._generate_intersection_vehicles(map_data, is_high_conflict)
+                
+                if not vehicles:
+                    failed_scenarios += 1
+                    continue
+                
+                # 构建图数据
+                graph_data = self._build_intersection_graph(vehicles, environment)
+                
+                if graph_data.x.size(0) == 0:
+                    failed_scenarios += 1
+                    continue
+                
+                # 生成路口安全标签
+                labels = self._generate_intersection_safety_labels(vehicles, map_data)
+                
+                # 验证数据一致性
+                if self._validate_data_consistency(graph_data, labels, len(vehicles)):
+                    data_list.append((graph_data, labels))
+                else:
+                    failed_scenarios += 1
+                
+            except Exception as e:
+                failed_scenarios += 1
+                if i < 10:
+                    print(f"⚠️ 生成场景 {i} 时出错: {str(e)}")
+                continue
+        
+        print(f"✅ 成功生成 {len(data_list)} 个路口训练场景")
+        print(f"📊 统计: 成功 {len(data_list)}, 失败 {failed_scenarios}")
+        
+        return data_list
+    
+    def _generate_intersection_vehicles(self, map_data: Dict, is_high_conflict: bool) -> List[Vehicle]:
+        """生成路口车辆场景"""
+        edges_data = map_data.get("intersection_edges", [])
+        if not edges_data:
+            return []
+        
+        # 创建路口边对象
+        edges = []
+        for edge_data in edges_data:
+            edge = IntersectionEdge(
+                edge_id=edge_data["edge_id"],
+                center_x=edge_data["center_x"],
+                center_y=edge_data["center_y"],
+                length=edge_data.get("length", 5),
+                direction=edge_data.get("direction", "")
+            )
+            edges.append(edge)
+        
+        if len(edges) < 2:
+            return []
+        
+        vehicles = []
+        
+        if is_high_conflict:
+            # 高冲突场景：每条边都有车辆，增加对角线冲突
+            for i, start_edge in enumerate(edges):
+                # 选择冲突目标边
+                if len(edges) >= 4:
+                    # 优先选择对角线边
+                    target_edges = [e for e in edges if e.edge_id != start_edge.edge_id]
+                    if len(target_edges) >= 2:
+                        end_edge = target_edges[i % len(target_edges)]
+                    else:
+                        end_edge = random.choice(target_edges)
+                else:
+                    # 边数较少时随机选择
+                    others = [e for e in edges if e.edge_id != start_edge.edge_id]
+                    end_edge = random.choice(others)
+                
+                task = Task(
+                    task_id=i + 1,
+                    start_edge=start_edge,
+                    end_edge=end_edge,
+                    start_pos=start_edge.get_random_integer_position(),
+                    end_pos=end_edge.get_random_integer_position(),
+                    priority=random.randint(2, 5)  # 高优先级范围
+                )
+                
+                vehicle = Vehicle(
+                    vehicle_id=i + 1,
+                    task=task,
+                    color='red'
+                )
+                vehicles.append(vehicle)
+                
+            # 额外添加一些汇聚车辆
+            if len(edges) >= 3:
+                target_edge = random.choice(edges)
+                source_edges = [e for e in edges if e.edge_id != target_edge.edge_id][:2]
+                
+                for j, source_edge in enumerate(source_edges):
+                    task = Task(
+                        task_id=len(vehicles) + j + 1,
+                        start_edge=source_edge,
+                        end_edge=target_edge,
+                        start_pos=source_edge.get_random_integer_position(),
+                        end_pos=target_edge.get_random_integer_position(),
+                        priority=random.randint(1, 4)
+                    )
+                    
+                    vehicle = Vehicle(
+                        vehicle_id=len(vehicles) + j + 1,
+                        task=task,
+                        color='orange'
+                    )
+                    vehicles.append(vehicle)
+        
+        else:
+            # 普通场景：适度数量的车辆，避免过度冲突
+            num_vehicles = random.randint(self.config.min_vehicles_per_scenario, 
+                                        min(len(edges), self.config.max_vehicles_per_scenario))
+            
+            selected_edges = random.sample(edges, min(num_vehicles, len(edges)))
+            
+            for i, start_edge in enumerate(selected_edges):
+                # 选择非相邻边
+                others = [e for e in edges if e.edge_id != start_edge.edge_id]
+                if len(others) >= 3:
+                    # 排除最近的边
+                    others.sort(key=lambda e: 
+                        math.sqrt((e.center_x - start_edge.center_x)**2 + 
+                                 (e.center_y - start_edge.center_y)**2))
+                    end_edge = random.choice(others[1:])  # 排除最近的
+                else:
+                    end_edge = random.choice(others)
+                
+                task = Task(
+                    task_id=i + 1,
+                    start_edge=start_edge,
+                    end_edge=end_edge,
+                    start_pos=start_edge.get_random_integer_position(),
+                    end_pos=end_edge.get_random_integer_position(),
+                    priority=random.randint(1, 4)
+                )
+                
+                vehicle = Vehicle(
+                    vehicle_id=i + 1,
+                    task=task,
+                    color='blue'
+                )
+                vehicles.append(vehicle)
+        
+        return vehicles
+    
+    def _build_intersection_graph(self, vehicles: List[Vehicle], environment) -> Data:
+        """构建路口交互图 - 兼容lifelong_planning.py的特征"""
+        
+        # 🎯 生成8维节点特征 (与lifelong_planning.py兼容)
+        node_features = self._extract_8d_node_features(vehicles)
+        
+        # 构建边特征
+        edge_indices, edge_features = self._build_intersection_edges(vehicles)
+        
+        # 全局特征
+        global_features = self._extract_global_features(vehicles)
+        
+        return Data(
+            x=torch.tensor(node_features, dtype=torch.float32),
+            edge_index=torch.tensor(edge_indices, dtype=torch.long).T if edge_indices else torch.zeros((2, 0), dtype=torch.long),
+            edge_attr=torch.tensor(edge_features, dtype=torch.float32) if edge_features else torch.zeros((0, 6), dtype=torch.float32),
+            global_features=torch.tensor(global_features, dtype=torch.float32)
+        )
+    
+    def _extract_8d_node_features(self, vehicles: List[Vehicle]) -> List[List[float]]:
+        """提取8维节点特征 - 与lifelong_planning.py完全兼容"""
+        features = []
+        
+        for vehicle in vehicles:
+            task = vehicle.task
+            start_x, start_y = task.start_pos
+            end_x, end_y = task.end_pos
+            
+            # 计算基础特征
+            dx = end_x - start_x
+            dy = end_y - start_y
+            distance_to_goal = math.sqrt(dx*dx + dy*dy)
+            goal_bearing = math.atan2(dy, dx)
+            
+            # 🎯 8维特征向量 (与lifelong_planning.py完全一致)
+            node_feature = [
+                (start_x - 50.0) / 50.0,          # [0] 相对环境中心x
+                math.cos(goal_bearing),           # [1] 航向余弦
+                math.sin(goal_bearing),           # [2] 航向正弦
+                3.0 / 8.0,                        # [3] 归一化速度 (固定3.0)
+                0.0,                              # [4] 归一化加速度
+                distance_to_goal / 100.0,         # [5] 归一化目标距离
+                math.cos(goal_bearing),           # [6] 目标方向余弦
+                task.priority / 10.0              # [7] 归一化优先级
+            ]
+            
+            features.append(node_feature)
+        
+        return features
+    
+    def _build_intersection_edges(self, vehicles: List[Vehicle]) -> Tuple[List, List]:
+        """构建路口边特征"""
+        edge_indices = []
+        edge_features = []
+        
+        for i in range(len(vehicles)):
+            for j in range(i + 1, len(vehicles)):
+                v1, v2 = vehicles[i], vehicles[j]
+                
+                # 计算交互特征
+                dist = math.sqrt((v1.task.start_pos[0] - v2.task.start_pos[0])**2 + 
+                               (v1.task.start_pos[1] - v2.task.start_pos[1])**2)
+                
+                if dist < 50.0:  # 交互范围
+                    # 路径交叉检测
+                    crossing = self._check_path_crossing(v1.task, v2.task)
+                    
+                    # 6维边特征
+                    edge_feat = [
+                        dist / 50.0,                    # 归一化距离
+                        6.0 / 16.0,                     # 平均速度
+                        0.0,                            # 角度差
+                        1.0 if crossing else 0.0,      # 路径交叉
+                        (v1.task.priority + v2.task.priority) / 10.0,  # 优先级
+                        0.5                             # 冲突风险
+                    ]
+                    
+                    edge_indices.extend([[i, j], [j, i]])
+                    edge_features.extend([edge_feat, edge_feat])
+        
+        return edge_indices, edge_features
+    
+    def _check_path_crossing(self, task1: Task, task2: Task) -> bool:
+        """检查两个任务的路径是否交叉"""
+        def ccw(A, B, C):
+            return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
+        
+        def intersect(A, B, C, D):
+            return ccw(A,C,D) != ccw(B,C,D) and ccw(A,B,C) != ccw(A,B,D)
+        
+        return intersect(task1.start_pos, task1.end_pos, task2.start_pos, task2.end_pos)
+    
+    def _extract_global_features(self, vehicles: List[Vehicle]) -> List[float]:
+        """提取全局特征"""
+        if not vehicles:
+            return [0.0] * 8
+        
+        n_vehicles = len(vehicles)
+        priorities = [v.task.priority for v in vehicles]
+        
+        # 计算冲突对数
+        conflicts = 0
+        total_pairs = 0
+        for i in range(n_vehicles):
+            for j in range(i + 1, n_vehicles):
+                total_pairs += 1
+                if self._check_path_crossing(vehicles[i].task, vehicles[j].task):
+                    conflicts += 1
+        
+        conflict_ratio = conflicts / max(total_pairs, 1)
+        
+        return [
+            n_vehicles / 10.0,           # 车辆数
+            3.0 / 8.0,                   # 平均速度
+            0.1,                         # 速度方差
+            50.0 / 100.0,                # 平均距离
+            10.0 / 100.0,                # 距离方差
+            sum(priorities) / (n_vehicles * 10),  # 平均优先级
+            conflict_ratio,              # 冲突比例
+            0.5                          # 预留特征
+        ]
+    
+    def _generate_intersection_safety_labels(self, vehicles: List[Vehicle], map_data: Dict) -> Dict:
+        """生成路口安全标签"""
+        labels = {
+            'priority': [],
+            'cooperation': [],
+            'urgency': [],
+            'safety': [],
+            'speed_adjustment': [],
+            'route_preference': []
+        }
+        
+        # 分析全局冲突情况
+        n_vehicles = len(vehicles)
+        total_conflicts = 0
+        for i in range(n_vehicles):
+            for j in range(i + 1, n_vehicles):
+                if self._check_path_crossing(vehicles[i].task, vehicles[j].task):
+                    total_conflicts += 1
+        
+        global_conflict_level = total_conflicts / max(n_vehicles * (n_vehicles - 1) / 2, 1)
+        
+        for vehicle in vehicles:
+            # 计算该车辆的冲突数
+            vehicle_conflicts = 0
+            for other in vehicles:
+                if other.vehicle_id != vehicle.vehicle_id:
+                    if self._check_path_crossing(vehicle.task, other.task):
+                        vehicle_conflicts += 1
+            
+            conflict_factor = vehicle_conflicts / max(n_vehicles - 1, 1)
+            
+            # 🛡️ 路口安全标签生成
+            
+            # 优先级调整
+            base_priority = (vehicle.task.priority - 3) / 3.0
+            if conflict_factor > 0.5:
+                priority_adj = base_priority * 0.7  # 高冲突时降低优先级
+            else:
+                priority_adj = base_priority
+            labels['priority'].append([np.tanh(priority_adj)])
+            
+            # 合作倾向
+            if global_conflict_level > 0.3:
+                cooperation = 0.8  # 高冲突环境下提高合作
+            else:
+                cooperation = 0.5 + conflict_factor * 0.3
+            labels['cooperation'].append([cooperation])
+            
+            # 紧急程度
+            if conflict_factor > 0.6:
+                urgency = 0.3  # 高冲突时降低紧急程度，优先安全
+            else:
+                urgency = 0.4 + conflict_factor * 0.2
+            labels['urgency'].append([urgency])
+            
+            # 🛡️ 安全系数 (路口最重要)
+            if conflict_factor > 0.5:
+                safety = 0.9  # 高冲突时最高安全要求
+            elif conflict_factor > 0.3:
+                safety = 0.8
+            else:
+                safety = 0.6 + conflict_factor * 0.2
+            labels['safety'].append([safety])
+            
+            # 速度调整
+            if conflict_factor > 0.4:
+                speed_adj = -0.3  # 高冲突时减速
+            elif global_conflict_level > 0.4:
+                speed_adj = -0.2  # 全局冲突时适度减速
+            else:
+                speed_adj = 0.0
+            labels['speed_adjustment'].append([speed_adj])
+            
+            # 路径偏好
+            if conflict_factor > 0.3:
+                # 高冲突时偏向避让
+                route_pref = [0.4, 0.2, 0.4]  # 左/直/右
+            else:
+                route_pref = [0.3, 0.4, 0.3]  # 均衡偏好
+            labels['route_preference'].append(route_pref)
+        
+        # 转换为张量
+        for key in labels:
+            labels[key] = torch.tensor(labels[key], dtype=torch.float32)
+        
+        return labels
+    
+    def _validate_data_consistency(self, graph_data: Data, labels: Dict, expected_nodes: int) -> bool:
+        """验证数据一致性"""
+        try:
+            actual_nodes = graph_data.x.size(0)
+            if actual_nodes != expected_nodes:
+                return False
+            
+            for key, label_tensor in labels.items():
+                if label_tensor.size(0) != expected_nodes:
+                    return False
+            
+            return True
+            
+        except Exception:
+            return False
+
+# 复用Pretraining_gnn.py的模型和训练器类
+class IntersectionVehicleCoordinationGNN(nn.Module):
+    """路口车辆协调GNN - 兼容8维输入"""
+    
+    def __init__(self, config: IntersectionTrainingConfig):
         super().__init__()
         
-        # 🔧 自动修正 hidden_dim 和 num_heads 的兼容性
-        if hidden_dim % num_heads != 0:
-            adjusted_hidden_dim = ((hidden_dim + num_heads - 1) // num_heads) * num_heads
-            print(f"⚠️ Auto-adjusting hidden_dim: {hidden_dim} → {adjusted_hidden_dim} (divisible by {num_heads} heads)")
-            hidden_dim = adjusted_hidden_dim
-        
-        self.hidden_dim = hidden_dim
-        self.node_dim = node_dim
-        self.edge_dim = edge_dim
+        self.config = config
+        self.node_dim = 8      # 🎯 兼容lifelong_planning.py的8维特征
+        self.edge_dim = 6
+        self.global_dim = 8
+        self.hidden_dim = config.hidden_dim
         
         # 编码器
         self.node_encoder = nn.Sequential(
-            nn.Linear(node_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU(), nn.Dropout(dropout)
+            nn.Linear(self.node_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout)
         )
         
-        # 边编码器
-        if edge_dim > 0:
-            self.edge_encoder = nn.Sequential(
-                nn.Linear(edge_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU()
-            )
-        else:
-            self.edge_encoder = None
-        
-        # 🔧 修复的Transformer层
-        self.transformer_layers = nn.ModuleList([
-            GraphTransformerLayer(hidden_dim, num_heads, dropout) for _ in range(num_layers)
+        # GNN层
+        self.gnn_layers = nn.ModuleList([
+            pyg_nn.GCNConv(self.hidden_dim, self.hidden_dim)
+            for _ in range(config.num_layers)
         ])
         
-        # 位置编码
-        self.pos_encoding = SpatioTemporalPositionalEncoding(hidden_dim)
-        
-        print(f"🧠 修复的时空图Transformer: {num_layers} 层, {num_heads} 头, 维度 {hidden_dim}")
-
-    def forward(self, node_features, edge_indices, edge_features):
-        try:
-            # 编码
-            h_nodes = self.node_encoder(node_features)
-            
-            # 边编码
-            if self.edge_encoder and edge_features.size(0) > 0:
-                h_edges = self.edge_encoder(edge_features)
-            else:
-                h_edges = edge_features if edge_features.size(0) > 0 else None
-            
-            # 位置编码
-            h_nodes = self.pos_encoding(h_nodes, node_features)
-            
-            # Transformer处理
-            attention_weights = []
-            for layer in self.transformer_layers:
-                h_nodes, h_edges, attn = layer(h_nodes, edge_indices, h_edges)
-                if attn is not None:
-                    attention_weights.append(attn)
-            
-            return {
-                'node_embeddings': h_nodes,
-                'edge_embeddings': h_edges,
-                'attention_weights': attention_weights
-            }
-            
-        except Exception as e:
-            print(f"❌ Transformer前向传播失败: {e}")
-            # 返回安全的默认值
-            batch_size = node_features.size(0) if node_features.size(0) > 0 else 0
-            return {
-                'node_embeddings': torch.zeros(batch_size, self.hidden_dim, device=node_features.device),
-                'edge_embeddings': None,
-                'attention_weights': []
-            }
-
-# =============================================================================
-# 🔧 修复版本：HierarchicalGraphPooling
-# =============================================================================
-
-class HierarchicalGraphPooling(nn.Module):
-    """📊 修复的分层图池化"""
-    
-    def __init__(self, hidden_dim, num_heads=4, pooling_ratio=0.5, num_levels=3):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_levels = min(num_levels, 2)  # 🔧 限制层数避免复杂度
-        
-        # 🔧 简化的池化策略
-        self.global_pool = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, hidden_dim)
-        )
-        
-        # 读出层
-        self.readout = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, hidden_dim)
-        )
-        
-        print(f"         ✅ 简化分层池化: {hidden_dim} -> {hidden_dim}")
-
-    def forward(self, x, edge_index, batch_size=1):
-        try:
-            if x.shape[0] == 0:
-                return torch.zeros(1, self.hidden_dim, device=x.device)
-            
-            # 🔧 简单的全局平均池化
-            if HAS_TORCH_GEOMETRIC:
-                try:
-                    batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-                    global_repr = global_mean_pool(x, batch)
-                except:
-                    global_repr = x.mean(dim=0, keepdim=True)
-            else:
-                global_repr = x.mean(dim=0, keepdim=True)
-            
-            # 应用池化网络
-            pooled = self.global_pool(global_repr)
-            final_repr = self.readout(pooled)
-            
-            return final_repr
-            
-        except Exception as e:
-            print(f"        ⚠️ 分层池化失败: {e}")
-            device = x.device if x.numel() > 0 else torch.device('cpu')
-            return torch.zeros(1, self.hidden_dim, device=device)
-
-# =============================================================================
-# 🔧 修复版本：AdvancedGNNCoordinator
-# =============================================================================
-
-class AdvancedGNNCoordinator(nn.Module):
-    """🎯 修复的高级GNN协调器"""
-    
-    def __init__(self, node_dim=10, edge_dim=6, hidden_dim=128, num_heads=8, num_transformer_layers=4, num_pooling_levels=3):
-        super().__init__()
-        
-        # 🔧 配置验证和修复
-        config = self._validate_and_fix_config(hidden_dim, num_heads, node_dim, edge_dim)
-        self.hidden_dim = config['hidden_dim']
-        self.node_dim = config['node_dim']
-        self.edge_dim = config['edge_dim']
-        
-        print(f"🔧 使用修复配置: hidden_dim={self.hidden_dim}, num_heads={config['num_heads']}")
-        
-        # 核心图Transformer
-        self.graph_transformer = SpatioTemporalGraphTransformer(
-            node_dim, edge_dim, self.hidden_dim, config['num_heads'], num_transformer_layers
-        )
-        
-        # 分层池化
-        self.hierarchical_pooling = HierarchicalGraphPooling(
-            self.hidden_dim, config['num_heads'], num_levels=min(num_pooling_levels, 2)
-        )
-        
-        # 🔧 修复的多模态决策头
+        # 决策输出头
         self.decision_heads = nn.ModuleDict({
             'priority': nn.Sequential(
-                nn.Linear(self.hidden_dim, 64), nn.ReLU(), nn.Dropout(0.1),
-                nn.Linear(64, 1), nn.Tanh()
+                nn.Linear(self.hidden_dim, 32),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(32, 1),
+                nn.Tanh()
             ),
             'cooperation': nn.Sequential(
-                nn.Linear(self.hidden_dim, 64), nn.ReLU(), nn.Dropout(0.1),
-                nn.Linear(64, 1), nn.Sigmoid()
+                nn.Linear(self.hidden_dim, 32),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(32, 1),
+                nn.Sigmoid()
             ),
-            'path_quality': nn.Sequential(
-                nn.Linear(self.hidden_dim, 64), nn.ReLU(), nn.Dropout(0.1),
-                nn.Linear(64, 1), nn.Sigmoid()
+            'urgency': nn.Sequential(
+                nn.Linear(self.hidden_dim, 32),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(32, 1),
+                nn.Sigmoid()
             ),
-            'avoidance_strength': nn.Sequential(
-                nn.Linear(self.hidden_dim, 64), nn.ReLU(), nn.Dropout(0.1),
-                nn.Linear(64, 1), nn.Sigmoid()
+            'safety': nn.Sequential(
+                nn.Linear(self.hidden_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(0.05),
+                nn.Linear(64, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1),
+                nn.Sigmoid()
             ),
-            'speed_factor': nn.Sequential(
-                nn.Linear(self.hidden_dim, 32), nn.ReLU(),
-                nn.Linear(32, 1), nn.Sigmoid()
+            'speed_adjustment': nn.Sequential(
+                nn.Linear(self.hidden_dim, 32),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(32, 1),
+                nn.Tanh()
+            ),
+            'route_preference': nn.Sequential(
+                nn.Linear(self.hidden_dim, 32),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(32, 3),
+                nn.Softmax(dim=-1)
             )
         })
+    
+    def forward(self, batch: Batch) -> Dict[str, torch.Tensor]:
+        """前向传播"""
+        x, edge_index = batch.x, batch.edge_index
         
-        # 全局策略
-        self.global_strategy = nn.Sequential(
-            nn.Linear(self.hidden_dim, 64), nn.ReLU(), nn.Linear(64, 8)
-        )
-        self.adaptive_weights = nn.Sequential(
-            nn.Linear(self.hidden_dim, 32), nn.ReLU(), nn.Linear(32, 5), nn.Softmax(dim=-1)
-        )
-        
-        print(f"🎯 修复的GNN协调器: {len(self.decision_heads)} 个决策头")
-
-    def _validate_and_fix_config(self, hidden_dim, num_heads, node_dim, edge_dim):
-        """验证并修复配置"""
-        # 🔧 修复hidden_dim和num_heads的兼容性
-        if hidden_dim % num_heads != 0:
-            adjusted_hidden_dim = ((hidden_dim + num_heads - 1) // num_heads) * num_heads
-            print(f"🔧 自动调整: hidden_dim {hidden_dim} → {adjusted_hidden_dim}")
-            hidden_dim = adjusted_hidden_dim
-        
-        return {
-            'hidden_dim': hidden_dim,
-            'num_heads': num_heads,
-            'node_dim': node_dim,
-            'edge_dim': edge_dim
-        }
-
-    def forward(self, interaction_graph):
-        try:
-            # 🔧 安全的特征检查
-            if not hasattr(interaction_graph, 'node_features') or interaction_graph.node_features.size(0) == 0:
-                return self._empty_output()
-            
-            # Transformer处理
-            transformer_output = self.graph_transformer(
-                interaction_graph.node_features,
-                interaction_graph.edge_indices,
-                interaction_graph.edge_features
-            )
-            
-            node_embeddings = transformer_output['node_embeddings']
-            
-            # 分层池化
-            if node_embeddings.size(0) > 0:
-                pooled_repr = self.hierarchical_pooling(
-                    node_embeddings, interaction_graph.edge_indices
-                )
-            else:
-                pooled_repr = torch.zeros(1, self.hidden_dim, device=node_embeddings.device)
-            
-            # 🔧 安全的多模态决策
-            decisions = {}
-            for decision_type, head in self.decision_heads.items():
-                try:
-                    if node_embeddings.size(0) > 0:
-                        decisions[decision_type] = head(node_embeddings)
-                    else:
-                        decisions[decision_type] = torch.zeros(0, 1)
-                except Exception as e:
-                    print(f"        ⚠️ 决策头 {decision_type} 失败: {e}")
-                    # 提供默认值
-                    default_val = 0.0 if decision_type == 'priority' else 0.5
-                    decisions[decision_type] = torch.full(
-                        (node_embeddings.size(0), 1), default_val, 
-                        device=node_embeddings.device
-                    )
-            
-            # 全局策略
-            try:
-                if pooled_repr.numel() > 0:
-                    decisions['global_strategy'] = self.global_strategy(pooled_repr.squeeze(0))
-                    decisions['adaptive_weights'] = self.adaptive_weights(pooled_repr.squeeze(0))
-                else:
-                    decisions['global_strategy'] = torch.zeros(8)
-                    decisions['adaptive_weights'] = torch.ones(5) / 5
-            except Exception as e:
-                print(f"        ⚠️ 全局策略失败: {e}")
-                decisions['global_strategy'] = torch.zeros(8)
-                decisions['adaptive_weights'] = torch.ones(5) / 5
-            
-            decisions['attention_weights'] = transformer_output.get('attention_weights', [])
-            decisions['node_embeddings'] = node_embeddings
-            
-            return decisions
-            
-        except Exception as e:
-            print(f"❌ GNN协调器前向传播失败: {e}")
+        if x.size(0) == 0:
             return self._empty_output()
-
-    def _empty_output(self):
-        """返回空输出"""
+        
+        # 节点编码
+        x = self.node_encoder(x)
+        
+        # GNN层
+        for gnn_layer in self.gnn_layers:
+            x = F.relu(gnn_layer(x, edge_index))
+            x = F.dropout(x, p=self.config.dropout, training=self.training)
+        
+        # 生成决策
+        decisions = {}
+        for decision_type, head in self.decision_heads.items():
+            decisions[decision_type] = head(x)
+        
+        return decisions
+    
+    def _empty_output(self) -> Dict[str, torch.Tensor]:
+        """空输出"""
         return {
             'priority': torch.zeros((0, 1)),
             'cooperation': torch.zeros((0, 1)),
-            'path_quality': torch.zeros((0, 1)),
-            'avoidance_strength': torch.zeros((0, 1)),
-            'speed_factor': torch.zeros((0, 1)),
-            'global_strategy': torch.zeros(8),
-            'adaptive_weights': torch.ones(5) / 5,
-            'attention_weights': [],
-            'node_embeddings': torch.zeros((0, self.hidden_dim))
+            'urgency': torch.zeros((0, 1)),
+            'safety': torch.zeros((0, 1)),
+            'speed_adjustment': torch.zeros((0, 1)),
+            'route_preference': torch.zeros((0, 3))
         }
 
-# =============================================================================
-# 📊 GNN性能监控
-# =============================================================================
-
-class GNNPerformanceMonitor:
-    """📊 GNN性能监控"""
+class IntersectionGraphDataset(Dataset):
+    """路口图数据集"""
     
-    def __init__(self):
-        self.metrics = {'inference_times': [], 'attention_entropies': [], 'planning_times': []}
-    
-    def log_inference(self, inference_time, attention_weights, decisions):
-        self.metrics['inference_times'].append(inference_time)
-        if attention_weights and len(attention_weights) > 0:
+    def __init__(self, scenarios_data: List[Tuple]):
+        self.data = []
+        
+        print(f"🔄 处理 {len(scenarios_data)} 个路口场景数据...")
+        
+        for i, (graph_data, labels) in enumerate(scenarios_data):
             try:
-                entropy = self._compute_attention_entropy(attention_weights[-1])
-                self.metrics['attention_entropies'].append(entropy)
-            except:
-                pass
-    
-    def _compute_attention_entropy(self, attention_weights):
-        if attention_weights.numel() == 0:
-            return 0.0
-        probs = F.softmax(attention_weights.flatten(), dim=-1)
-        entropy = -(probs * torch.log(probs + 1e-8)).sum()
-        return entropy.item()
-    
-    def generate_report(self, filename, planning_stats):
-        print(f"📊 GNN Performance Summary:")
-        print(f"   Avg Inference Time: {np.mean(self.metrics['inference_times']):.3f}s")
-        if self.metrics['attention_entropies']:
-            print(f"   Avg Attention Entropy: {np.mean(self.metrics['attention_entropies']):.3f}")
-        return filename
-
-# =============================================================================
-# 🚀 修复版本：AdvancedGNNMultiVehicleCoordinator
-# =============================================================================
-
-class AdvancedGNNMultiVehicleCoordinator:
-    """🚀 修复的高级GNN多车协调器主类"""
-    
-    def __init__(self, map_file_path=None, optimization_level=None, gnn_enhancement_level=None, gnn_config=None):
-        # 默认配置
-        if optimization_level is None:
-            optimization_level = OptimizationLevel.FULL if HAS_TRYING else "full"
-        if gnn_enhancement_level is None:
-            gnn_enhancement_level = GNNEnhancementLevel.FULL_INTEGRATION if HAS_TRANS else "full_integration"
-        
-        # 基础组件初始化
-        if HAS_TRYING:
-            self.base_coordinator = MultiVehicleCoordinator(map_file_path, optimization_level)
-            self.environment = self.base_coordinator.environment
-            self.params = self.base_coordinator.params
-            self.map_data = self.base_coordinator.map_data
-            print("✅ Using trying.py MultiVehicleCoordinator")
-        else:
-            self.environment = self._create_fallback_environment()
-            self.params = VehicleParameters()
-            self.map_data = self._load_fallback_map(map_file_path)
-            print("⚠️ Using fallback environment")
-        
-        # 🔧 修复的GNN配置 - 确保兼容性
-        default_gnn_config = {
-            'node_dim': 10, 
-            'edge_dim': 6, 
-            'hidden_dim': 64,    # 🔧 改为64确保与多种num_heads兼容
-            'num_heads': 4,      # 🔧 改为4，64/4=16完美整除
-            'num_transformer_layers': 2,  # 🔧 减少层数提高稳定性
-            'num_pooling_levels': 2       # 🔧 减少池化层数
-        }
-        if gnn_config:
-            default_gnn_config.update(gnn_config)
-        
-        # 🔧 验证和修正配置
-        default_gnn_config = self._validate_gnn_config(default_gnn_config)
-        
-        # 初始化GNN组件
-        self.gnn_coordinator = AdvancedGNNCoordinator(**default_gnn_config)
-        self.gnn_coordinator.eval()
-        
-        # 图构建器
-        if HAS_TRANS:
-            self.graph_builder = VehicleGraphBuilder(self.params)
-        else:
-            self.graph_builder = self._create_fallback_graph_builder()
-        
-        # 性能监控
-        self.performance_monitor = GNNPerformanceMonitor()
-        self.planning_stats = {'gnn_inferences': 0, 'total_planning_time': 0, 'vehicles_planned': 0, 'success_rate': 0.0}
-        
-        print(f"🚀 修复的Advanced GNN Multi-Vehicle Coordinator initialized")
-        print(f"🔧 修复配置: {default_gnn_config}")
-
-    def _validate_gnn_config(self, config):
-        """🔧 验证和修正GNN配置"""
-        hidden_dim = config['hidden_dim']
-        num_heads = config['num_heads']
-        
-        # 检查hidden_dim是否能被num_heads整除
-        if hidden_dim % num_heads != 0:
-            # 策略1: 调整hidden_dim到最近的兼容值
-            adjusted_hidden_dim = ((hidden_dim + num_heads - 1) // num_heads) * num_heads
-            
-            # 策略2: 如果调整幅度太大，则调整num_heads
-            if abs(adjusted_hidden_dim - hidden_dim) > hidden_dim * 0.1:
-                possible_heads = [1, 2, 4, 8, 16, 32, 64]
-                best_heads = min(possible_heads, key=lambda h: abs(h - num_heads) if hidden_dim % h == 0 else float('inf'))
-                
-                if hidden_dim % best_heads == 0:
-                    print(f"🔧 Auto-adjusting num_heads: {num_heads} → {best_heads} (for hidden_dim={hidden_dim})")
-                    config['num_heads'] = best_heads
-                else:
-                    print(f"🔧 Auto-adjusting hidden_dim: {hidden_dim} → {adjusted_hidden_dim} (for num_heads={num_heads})")
-                    config['hidden_dim'] = adjusted_hidden_dim
-            else:
-                print(f"🔧 Auto-adjusting hidden_dim: {hidden_dim} → {adjusted_hidden_dim} (for num_heads={num_heads})")
-                config['hidden_dim'] = adjusted_hidden_dim
-        
-        return config
-
-    def create_scenarios_from_json(self):
-        """创建场景"""
-        if HAS_TRYING and hasattr(self, 'base_coordinator'):
-            return self.base_coordinator.create_scenario_from_json()
-        else:
-            return self._create_test_scenarios()
-
-    def plan_all_vehicles_with_gnn(self, scenarios):
-        """🧠 主规划函数"""
-        print(f"\n🧠 Advanced GNN Multi-Vehicle Planning: {len(scenarios)} vehicles")
-        
-        # GNN智能排序
-        gnn_sorted_scenarios = self._gnn_intelligent_sorting(scenarios)
-        
-        results = {}
-        high_priority_trajectories = []
-        total_start_time = time.time()
-        
-        # 逐车规划
-        for i, scenario in enumerate(gnn_sorted_scenarios):
-            print(f"\n--- 🚗 Vehicle {scenario['id']} (GNN Rank #{i+1}) ---")
-            
-            vehicle_start_time = time.time()
-            
-            # 构建车辆上下文
-            vehicles_info = self._create_vehicle_context(scenario, gnn_sorted_scenarios, high_priority_trajectories)
-            
-            # GNN推理
-            gnn_guidance = self._gnn_inference_for_vehicle(vehicles_info, scenario['id'])
-            
-            # 执行规划
-            trajectory = self._plan_single_vehicle_with_gnn(scenario, gnn_guidance, high_priority_trajectories)
-            
-            vehicle_planning_time = time.time() - vehicle_start_time
-            
-            # 记录结果
-            if trajectory:
-                print(f"✅ SUCCESS: {len(trajectory)} waypoints")
-                results[scenario['id']] = {
-                    'trajectory': trajectory, 'color': scenario['color'],
-                    'description': scenario['description'], 'planning_time': vehicle_planning_time,
-                    'gnn_guidance': gnn_guidance
-                }
-                high_priority_trajectories.append(trajectory)
-            else:
-                print(f"❌ FAILED")
-                results[scenario['id']] = {
-                    'trajectory': [], 'color': scenario['color'],
-                    'description': scenario['description'], 'planning_time': vehicle_planning_time,
-                    'gnn_guidance': gnn_guidance
-                }
-            
-            self.planning_stats['vehicles_planned'] += 1
-            self.planning_stats['total_planning_time'] += vehicle_planning_time
-        
-        # 最终统计
-        total_time = time.time() - total_start_time
-        success_count = sum(1 for r in results.values() if r['trajectory'])
-        self.planning_stats['success_rate'] = success_count / len(scenarios) if scenarios else 0
-        
-        print(f"\n📊 Advanced GNN Results: {success_count}/{len(scenarios)} ({100*self.planning_stats['success_rate']:.1f}%) in {total_time:.2f}s")
-        
-        return results, gnn_sorted_scenarios
-
-    def _gnn_intelligent_sorting(self, scenarios):
-        """🧠 GNN智能排序"""
-        print("🧠 GNN Intelligent Sorting...")
-        
-        try:
-            vehicles_info = [{'id': s['id'], 'current_state': s['start'], 'goal_state': s['goal'], 'priority': s['priority']} for s in scenarios]
-            global_graph = self.graph_builder.build_interaction_graph(vehicles_info)
-            
-            start_time = time.time()
-            with torch.no_grad():
-                gnn_decisions = self.gnn_coordinator(global_graph)
-            
-            self.planning_stats['gnn_inferences'] += 1
-            self.performance_monitor.log_inference(time.time() - start_time, gnn_decisions.get('attention_weights'), gnn_decisions)
-            
-            # 智能优先级计算
-            intelligent_priorities = []
-            priority_adj = gnn_decisions.get('priority', torch.zeros(len(scenarios), 1))
-            cooperation_scores = gnn_decisions.get('cooperation', torch.zeros(len(scenarios), 1))
-            
-            for i, scenario in enumerate(scenarios):
-                if i < priority_adj.shape[0]:
-                    base_priority = scenario['priority']
-                    gnn_adjustment = priority_adj[i, 0].item() if priority_adj.numel() > i else 0.0
-                    cooperation = cooperation_scores[i, 0].item() if cooperation_scores.numel() > i else 0.5
-                    intelligent_priority = base_priority + gnn_adjustment * 2.0 + cooperation * 1.0
-                    
-                    intelligent_priorities.append({
-                        'scenario': scenario, 'intelligent_priority': intelligent_priority,
-                        'gnn_adjustment': gnn_adjustment, 'cooperation_score': cooperation
-                    })
-                    
-                    print(f"   V{scenario['id']}: {base_priority:.1f} → {intelligent_priority:.2f}")
-                else:
-                    intelligent_priorities.append({
-                        'scenario': scenario, 'intelligent_priority': scenario['priority'],
-                        'gnn_adjustment': 0.0, 'cooperation_score': 0.5
-                    })
-            
-            intelligent_priorities.sort(key=lambda x: x['intelligent_priority'], reverse=True)
-            return [item['scenario'] for item in intelligent_priorities]
-            
-        except Exception as e:
-            print(f"⚠️ GNN排序失败: {e}，使用默认排序")
-            return sorted(scenarios, key=lambda x: x['priority'], reverse=True)
-
-    def _gnn_inference_for_vehicle(self, vehicles_info, target_vehicle_id):
-        """🧠 单车GNN推理"""
-        try:
-            interaction_graph = self.graph_builder.build_interaction_graph(vehicles_info)
-            
-            start_time = time.time()
-            with torch.no_grad():
-                gnn_decisions = self.gnn_coordinator(interaction_graph)
-            
-            self.planning_stats['gnn_inferences'] += 1
-            
-            # 提取目标车辆指导
-            target_index = next((i for i, v in enumerate(vehicles_info) if v['id'] == target_vehicle_id), 0)
-            guidance = {}
-            
-            for decision_type, values in gnn_decisions.items():
-                try:
-                    if isinstance(values, torch.Tensor) and len(values.shape) >= 2 and target_index < values.shape[0]:
-                        val = values[target_index].squeeze()
-                        guidance[decision_type] = val.item() if val.numel() == 1 else val
-                    elif isinstance(values, torch.Tensor) and len(values.shape) == 1:
-                        guidance[decision_type] = values[0].item() if values.numel() == 1 else values
-                except:
-                    # 提供默认值
-                    if decision_type == 'priority':
-                        guidance[decision_type] = 0.0
-                    elif decision_type in ['cooperation', 'path_quality', 'avoidance_strength', 'speed_factor']:
-                        guidance[decision_type] = 0.5
-            
-            return guidance
-            
-        except Exception as e:
-            print(f"⚠️ GNN推理失败: {e}")
-            return {'priority': 0.0, 'cooperation': 0.5, 'path_quality': 0.5, 'avoidance_strength': 0.5, 'speed_factor': 1.0}
-
-    def _plan_single_vehicle_with_gnn(self, scenario, gnn_guidance, existing_trajectories):
-        """🚗 GNN指导的单车规划"""
-        if HAS_TRYING:
-            planner = VHybridAStarPlanner(self.environment, self.base_coordinator.optimization_level)
-            self._apply_gnn_guidance_to_planner(planner, gnn_guidance)
-            return planner.search_with_waiting(scenario['start'], scenario['goal'], scenario['id'], existing_trajectories)
-        else:
-            return self._fallback_planning(scenario, gnn_guidance)
-
-    def _apply_gnn_guidance_to_planner(self, planner, guidance):
-        """🎯 应用GNN指导"""
-        if not guidance or not hasattr(planner, 'params'):
-            return
-        
-        try:
-            priority_adj = guidance.get('priority', 0.0)
-            cooperation = guidance.get('cooperation', 0.5)
-            avoidance_strength = guidance.get('avoidance_strength', 0.5)
-            speed_factor = guidance.get('speed_factor', 1.0)
-            
-            if priority_adj > 0.3:
-                planner.params.max_speed *= (1.0 + priority_adj * 0.1)
-                planner.max_iterations = int(planner.max_iterations * 1.2)
-            elif priority_adj < -0.3:
-                planner.params.green_additional_safety *= (1.0 + abs(priority_adj) * 0.2)
-                planner.params.max_speed *= (1.0 - abs(priority_adj) * 0.1)
-            
-            if cooperation > 0.7:
-                planner.params.green_additional_safety *= (1.0 + cooperation * 0.15)
-            
-            if avoidance_strength > 0.7:
-                planner.params.green_additional_safety *= (1.0 + avoidance_strength * 0.3)
-            
-            planner.params.max_speed *= speed_factor
-            
-            print(f"      🎯 GNN Guidance: priority={priority_adj:.2f}, coop={cooperation:.2f}, avoid={avoidance_strength:.2f}")
-            
-        except Exception as e:
-            print(f"      ⚠️ 应用GNN指导失败: {e}")
-
-    def create_animation_with_gnn_analysis(self, results, scenarios):
-        """🎬 创建动画"""
-        if HAS_TRYING and hasattr(self, 'base_coordinator'):
-            return self.base_coordinator.create_animation(results, scenarios)
-        else:
-            self._create_simple_plot(results, scenarios)
-
-    def generate_gnn_performance_report(self, filename="gnn_performance_report.html"):
-        """📊 生成报告"""
-        return self.performance_monitor.generate_report(filename, self.planning_stats)
-
-    def _create_vehicle_context(self, target_scenario, all_scenarios, existing_trajectories):
-        """创建车辆上下文"""
-        vehicles_info = [{'id': target_scenario['id'], 'current_state': target_scenario['start'], 'goal_state': target_scenario['goal'], 'priority': target_scenario['priority']}]
-        
-        for scenario in all_scenarios:
-            if scenario['id'] != target_scenario['id']:
-                distance = math.sqrt((scenario['start'].x - target_scenario['start'].x)**2 + (scenario['start'].y - target_scenario['start'].y)**2)
-                if distance < 50:
-                    vehicles_info.append({'id': scenario['id'], 'current_state': scenario['start'], 'goal_state': scenario['goal'], 'priority': scenario['priority']})
-        
-        return vehicles_info
-
-    # Fallback methods
-    def _create_fallback_environment(self):
-        class FallbackEnv:
-            def __init__(self): self.size = 100; self.map_name = "fallback"
-            def load_from_json(self, file_path): return {"mock": "data"}
-            def is_collision_free(self, state, params): return True
-        return FallbackEnv()
-
-    def _load_fallback_map(self, map_file_path):
-        if map_file_path and os.path.exists(map_file_path):
-            try:
-                with open(map_file_path, 'r') as f:
-                    return json.load(f)
-            except:
-                pass
-        return None
-
-    def _create_fallback_graph_builder(self):
-        class FallbackGraphBuilder:
-            def __init__(self, params): self.params = params
-            def build_interaction_graph(self, vehicles_info):
-                n = len(vehicles_info)
-                return VehicleInteractionGraph(
-                    node_features=torch.randn(n, 10), edge_indices=torch.zeros((2, 0), dtype=torch.long),
-                    edge_features=torch.zeros((0, 6)), vehicle_ids=[v['id'] for v in vehicles_info],
-                    adjacency_matrix=torch.zeros((n, n)), global_features=torch.zeros(8)
+                data_obj = Data(
+                    x=graph_data.x,
+                    edge_index=graph_data.edge_index,
+                    edge_attr=graph_data.edge_attr,
+                    global_features=graph_data.global_features,
+                    y_priority=labels['priority'],
+                    y_cooperation=labels['cooperation'],
+                    y_urgency=labels['urgency'],
+                    y_safety=labels['safety'],
+                    y_speed_adjustment=labels['speed_adjustment'],
+                    y_route_preference=labels['route_preference']
                 )
-        return FallbackGraphBuilder(self.params)
+                
+                num_nodes = data_obj.x.size(0)
+                if (data_obj.y_priority.size(0) == num_nodes and
+                    data_obj.y_cooperation.size(0) == num_nodes):
+                    self.data.append(data_obj)
+                else:
+                    if i < 5:
+                        print(f"⚠️ 跳过场景 {i}: 标签与节点数不匹配")
+                    
+            except Exception as e:
+                if i < 5:
+                    print(f"⚠️ 处理场景 {i} 时出错: {str(e)}")
+                continue
+        
+        print(f"✅ 成功处理 {len(self.data)} 个有效路口场景")
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx]
 
-    def _create_test_scenarios(self):
-        return [
-            {'id': 1, 'priority': 1, 'color': 'red', 'start': VehicleState(10, 10, 0, 3, 0), 'goal': VehicleState(90, 90, 0, 2, 0), 'description': 'Test Vehicle 1'},
-            {'id': 2, 'priority': 1, 'color': 'blue', 'start': VehicleState(90, 10, math.pi/2, 3, 0), 'goal': VehicleState(10, 90, math.pi/2, 2, 0), 'description': 'Test Vehicle 2'}
-        ]
-
-    def _fallback_planning(self, scenario, guidance):
-        """Fallback规划"""
-        start, goal = scenario['start'], scenario['goal']
-        trajectory = [start]
-        for i in range(1, 11):
-            t = i / 10
-            x = start.x + t * (goal.x - start.x)
-            y = start.y + t * (goal.y - start.y)
-            trajectory.append(VehicleState(x, y, start.theta, start.v, i * 1.0))
-        return trajectory
-
-    def _create_simple_plot(self, results, scenarios):
-        """简单绘图"""
-        try:
-            import matplotlib.pyplot as plt
-            fig, ax = plt.subplots(figsize=(10, 10))
-            for vehicle_id, result in results.items():
-                if result['trajectory']:
-                    traj = result['trajectory']
-                    xs, ys = [s.x for s in traj], [s.y for s in traj]
-                    ax.plot(xs, ys, color=result['color'], linewidth=2, label=result['description'])
-            ax.set_xlim(0, 100); ax.set_ylim(0, 100); ax.legend(); ax.set_title("Advanced GNN Planning Results")
-            plt.show()
-        except ImportError:
-            print("⚠️ Matplotlib not available for plotting")
-
-# =============================================================================
-# 🚀 主函数
-# =============================================================================
+class IntersectionGNNTrainer:
+    """路口GNN训练器"""
+    
+    def __init__(self, config: IntersectionTrainingConfig):
+        self.config = config
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"🔧 使用设备: {self.device}")
+        
+        self.model = IntersectionVehicleCoordinationGNN(config).to(self.device)
+        
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay
+        )
+        
+        self.scheduler = torch.optim.lr_scheduler.StepLR(
+            self.optimizer, step_size=12, gamma=0.7
+        )
+        
+        # 损失函数
+        self.mse_loss = nn.MSELoss()
+        self.bce_loss = nn.BCELoss()
+        self.ce_loss = nn.CrossEntropyLoss()
+        
+        # 训练记录
+        self.train_losses = []
+        self.val_losses = []
+        self.best_val_loss = float('inf')
+        self.patience_counter = 0
+    
+    def compute_batch_loss(self, predictions: Dict, batch: Batch) -> torch.Tensor:
+        """计算批次损失"""
+        total_loss = 0.0
+        
+        # 🛡️ 路口安全优先的损失权重
+        loss_weights = {
+            'priority': 1.0,
+            'cooperation': 1.2,
+            'urgency': 1.0,
+            'safety': self.config.safety_priority_weight,  # 路口安全权重最高
+            'speed_adjustment': 0.8,
+            'route_preference': 1.0
+        }
+        
+        for task in ['priority', 'cooperation', 'urgency', 'safety', 'speed_adjustment']:
+            if task in predictions and hasattr(batch, f'y_{task}'):
+                y_true = getattr(batch, f'y_{task}')
+                if y_true.size(0) > 0:
+                    if task in ['cooperation', 'urgency', 'safety']:
+                        loss = self.bce_loss(predictions[task], y_true)
+                        # 🛡️ 安全额外惩罚
+                        if task == 'safety':
+                            safety_penalty = torch.mean(torch.relu(y_true - predictions[task])) * 0.3
+                            loss += safety_penalty
+                    else:
+                        loss = self.mse_loss(predictions[task], y_true)
+                    total_loss += loss_weights[task] * loss
+        
+        if 'route_preference' in predictions and hasattr(batch, 'y_route_preference'):
+            y_route = batch.y_route_preference
+            if y_route.size(0) > 0:
+                loss = self.ce_loss(predictions['route_preference'], y_route)
+                total_loss += loss_weights['route_preference'] * loss
+        
+        return total_loss
+    
+    def train_epoch(self, dataloader) -> float:
+        """训练一个epoch"""
+        self.model.train()
+        total_loss = 0.0
+        num_batches = 0
+        
+        for batch in tqdm(dataloader, desc="🛡️ 路口训练"):
+            try:
+                self.optimizer.zero_grad()
+                batch = batch.to(self.device)
+                predictions = self.model(batch)
+                loss = self.compute_batch_loss(predictions, batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+                num_batches += 1
+                
+            except Exception as e:
+                print(f"⚠️ 训练批次出错: {str(e)}")
+                continue
+        
+        return total_loss / max(num_batches, 1)
+    
+    def validate(self, dataloader) -> float:
+        """验证"""
+        self.model.eval()
+        total_loss = 0.0
+        num_batches = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc="🛡️ 路口验证"):
+                try:
+                    batch = batch.to(self.device)
+                    predictions = self.model(batch)
+                    loss = self.compute_batch_loss(predictions, batch)
+                    total_loss += loss.item()
+                    num_batches += 1
+                except Exception as e:
+                    continue
+        
+        return total_loss / max(num_batches, 1)
+    
+    def train(self, train_dataset: IntersectionGraphDataset, val_dataset: IntersectionGraphDataset):
+        """完整训练流程"""
+        print(f"🛡️ 开始训练路口GNN模型...")
+        print(f"  训练数据: {len(train_dataset)} 个路口场景")
+        print(f"  验证数据: {len(val_dataset)} 个路口场景")
+        print(f"  🛡️ 安全损失权重: {self.config.safety_priority_weight}")
+        
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=self.config.batch_size, 
+            shuffle=True,
+            follow_batch=['x']
+        )
+        
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=self.config.batch_size, 
+            shuffle=False,
+            follow_batch=['x']
+        )
+        
+        for epoch in range(self.config.num_epochs):
+            print(f"\n📊 Epoch {epoch+1}/{self.config.num_epochs} (🛡️ 路口安全训练)")
+            
+            train_loss = self.train_epoch(train_loader)
+            self.train_losses.append(train_loss)
+            
+            val_loss = self.validate(val_loader)
+            self.val_losses.append(val_loss)
+            
+            self.scheduler.step()
+            
+            print(f"  训练损失: {train_loss:.4f}")
+            print(f"  验证损失: {val_loss:.4f}")
+            print(f"  学习率: {self.optimizer.param_groups[0]['lr']:.6f}")
+            
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.patience_counter = 0
+                self.save_model('best_intersection_gnn_model.pth')
+                print(f"  ✅ 验证损失改善，保存最佳路口模型")
+            else:
+                self.patience_counter += 1
+                print(f"  ⏳ 验证损失未改善 ({self.patience_counter}/{self.config.early_stopping_patience})")
+            
+            if self.patience_counter >= self.config.early_stopping_patience:
+                print(f"  🛑 早停")
+                break
+        
+        print(f"\n🎉 路口GNN训练完成！最佳验证损失: {self.best_val_loss:.4f}")
+    
+    def save_model(self, filepath: str):
+        """保存模型"""
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': self.config,
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'best_val_loss': self.best_val_loss
+        }, filepath)
 
 def main():
-    """🚀 主函数"""
-    print("🚀 Advanced GNN Framework for Multi-Vehicle Path Planning - 修复版")
+    """🛡️ 路口GNN预训练主流程"""
+    print("🛡️ 路口GNN预训练系统")
     print("=" * 80)
-    print("🎯 状态:")
-    print(f"   trying.py: {'✅ 集成' if HAS_TRYING else '❌ 未找到'}")
-    print(f"   trans.py: {'✅ 集成' if HAS_TRANS else '❌ 未找到'}")
-    print(f"   PyTorch Geometric: {'✅ 可用' if HAS_TORCH_GEOMETRIC else '❌ 使用回退'}")
+    print("🎯 专为lifelong_planning.py路口场景设计:")
+    print("   ✅ 🛡️ 支持intersection_edges地图格式")
+    print("   ✅ 🛡️ 每条边一个任务的训练数据生成")
+    print("   ✅ 🛡️ 8维特征兼容性")
+    print("   ✅ 🛡️ 路口冲突安全标签生成")
+    print("   ✅ 🛡️ 高冲突场景专门训练")
     print("=" * 80)
     
-    # 选择地图
-    if HAS_TRYING:
-        selected_file = interactive_json_selection()
-    else:
-        json_files = [f for f in os.listdir('.') if f.endswith('.json')]
-        selected_file = json_files[0] if json_files else None
-        print(f"📁 使用: {selected_file or 'test scenarios'}")
-    
-    # 🔧 使用修复的安全配置
-    print("\n🧠 初始化修复的Advanced GNN Coordinator...")
-    coordinator = AdvancedGNNMultiVehicleCoordinator(
-        map_file_path=selected_file,
-        gnn_config={
-            'hidden_dim': 64,    # 🔧 安全值：64/4=16
-            'num_heads': 4,      # 🔧 安全值：确保整除性
-            'num_transformer_layers': 2,  # 🔧 降低复杂度
-            'num_pooling_levels': 2       # 🔧 简化池化
-        }
-    )
-    
-    # 创建场景
-    scenarios = coordinator.create_scenarios_from_json()
-    if not scenarios:
-        print("❌ No scenarios found")
-        return
-    
-    print(f"\n🚗 规划 {len(scenarios)} 辆车...")
-    for s in scenarios:
-        print(f"   Vehicle {s['id']}: {s['description']}")
-    
-    # 执行规划
-    start_time = time.time()
-    results, sorted_scenarios = coordinator.plan_all_vehicles_with_gnn(scenarios)
-    total_time = time.time() - start_time
-    
-    # 结果分析
-    success_count = sum(1 for r in results.values() if r['trajectory'])
-    
-    print(f"\n📊 最终结果:")
-    print(f"   🎯 成功率: {success_count}/{len(scenarios)} ({100*success_count/len(scenarios):.1f}%)")
-    print(f"   ⏱️ 总时间: {total_time:.2f}s")
-    print(f"   🧠 GNN推理: {coordinator.planning_stats['gnn_inferences']}次")
-    
-    # 详细结果
-    print(f"\n📋 车辆详情:")
-    for vehicle_id, result in results.items():
-        status = "✅ 成功" if result['trajectory'] else "❌ 失败"
-        traj_info = f"{len(result['trajectory'])} 点" if result['trajectory'] else "无轨迹"
-        print(f"   Vehicle {vehicle_id}: {status} - {traj_info}")
-    
-    # 可视化
-    if success_count > 0:
-        print(f"\n🎬 创建可视化...")
-        try:
-            coordinator.create_animation_with_gnn_analysis(results, scenarios)
-        except Exception as e:
-            print(f"⚠️ 可视化失败: {e}")
+    # 路口训练配置
+    config = IntersectionTrainingConfig(
+        batch_size=4,
+        learning_rate=0.0008,
+        num_epochs=40,
+        hidden_dim=64,
+        num_layers=3,
+        dropout=0.15,
         
-        # 保存数据
-        if HAS_TRYING:
-            try:
-                save_trajectories(results, f"advanced_gnn_results_{int(time.time())}.json")
-                print("💾 结果已保存")
-            except:
-                print("⚠️ 保存失败")
-    
-    print(f"\n🎉 Advanced GNN Framework 演示完成!")
-
-def quick_test():
-    """🧪 快速测试"""
-    print("🧪 Quick Test Mode")
-    
-    # 🔧 使用修复的安全配置
-    coordinator = AdvancedGNNMultiVehicleCoordinator(
-        gnn_config={'hidden_dim': 32, 'num_heads': 4, 'num_transformer_layers': 1}
+        # 路口特化配置
+        num_scenarios=2000,
+        num_map_variants=8,
+        max_vehicles_per_scenario=8,
+        min_vehicles_per_scenario=3,
+        
+        # 安全配置
+        min_safe_distance=8.0,
+        safety_priority_weight=1.8,
+        high_conflict_ratio=0.4
     )
     
-    test_scenarios = coordinator._create_test_scenarios()
-    results, _ = coordinator.plan_all_vehicles_with_gnn(test_scenarios)
+    print(f"\n📋 🛡️ 路口训练配置:")
+    print(f"  数据集大小: {config.num_scenarios}")
+    print(f"  高冲突场景比例: {config.high_conflict_ratio*100:.0f}%")
+    print(f"  安全损失权重: {config.safety_priority_weight}x")
+    print(f"  地图变体数: {config.num_map_variants}")
+    print(f"  特征维度: 8维节点 + 6维边 + 8维全局")
     
-    success = sum(1 for r in results.values() if r['trajectory'])
-    print(f"🧪 Test Result: {success}/{len(test_scenarios)} vehicles planned successfully")
-    
-    return results
-
-# 便捷函数
-def create_advanced_coordinator(map_file=None, **gnn_config):
-    """🎯 便捷创建函数"""
-    # 🔧 应用默认安全配置
-    safe_config = {'hidden_dim': 64, 'num_heads': 4, 'num_transformer_layers': 2}
-    safe_config.update(gnn_config)
-    return AdvancedGNNMultiVehicleCoordinator(map_file_path=map_file, gnn_config=safe_config)
-
-def test_config_compatibility():
-    """🧪 测试配置兼容性"""
-    print("🧪 Testing GNN Configuration Compatibility...")
-    
-    test_configs = [
-        {'hidden_dim': 64, 'num_heads': 4},   # ✅ 64/4=16
-        {'hidden_dim': 64, 'num_heads': 8},   # ✅ 64/8=8
-        {'hidden_dim': 32, 'num_heads': 4},   # ✅ 32/4=8
-        {'hidden_dim': 128, 'num_heads': 8},  # ✅ 128/8=16
-        {'hidden_dim': 64, 'num_heads': 6},   # ❌ 64/6=10.67 (will auto-fix)
-    ]
-    
-    for i, config in enumerate(test_configs):
-        print(f"\n🧪 Test {i+1}: hidden_dim={config['hidden_dim']}, num_heads={config['num_heads']}")
-        try:
-            coordinator = AdvancedGNNMultiVehicleCoordinator(gnn_config=config)
-            actual_config = coordinator.gnn_coordinator.hidden_dim
-            print(f"    ✅ Success: final hidden_dim={actual_config}")
-        except Exception as e:
-            print(f"    ❌ Failed: {e}")
-
-print("✅ 修复的Advanced GNN Framework已加载!")
-print("📖 使用方法: main() | quick_test() | test_config_compatibility() | create_advanced_coordinator()")
-print("🔧 推荐配置:")
-print("   • hidden_dim=64, num_heads=4   (16 dim/head)")
-print("   • hidden_dim=64, num_heads=8   (8 dim/head)")  
-print("   • hidden_dim=32, num_heads=4   (8 dim/head)")
-
-def safe_main():
-    """🛡️ 安全的主函数，带错误处理"""
     try:
-        main()
-    except Exception as e:
-        print(f"\n❌ Error occurred: {e}")
-        print("\n🔧 故障排除建议:")
-        print("   1. 检查trying.py和trans.py是否在同目录")
-        print("   2. 尝试更小的GNN配置: hidden_dim=32, num_heads=4")
-        print("   3. 运行test_config_compatibility()验证设置")
-        print("   4. 运行quick_test()检查基本功能")
+        # 1. 生成路口训练数据
+        print(f"\n📊 步骤1: 生成路口训练数据")
+        generator = IntersectionVehicleScenarioGenerator(config)
+        all_data = generator.generate_training_data()
         
-        print(f"\n🧪 运行快速测试作为回退...")
-        try:
-            quick_test()
-        except Exception as e2:
-            print(f"❌ 快速测试也失败: {e2}")
-            print("🔧 请检查PyTorch安装和依赖")
+        if len(all_data) < 20:
+            print("❌ 生成的有效路口数据太少，无法训练")
+            return
+        
+        # 2. 划分数据集
+        val_size = max(5, int(len(all_data) * config.val_split))
+        train_size = len(all_data) - val_size
+        
+        train_data = all_data[:train_size]
+        val_data = all_data[train_size:]
+        
+        print(f"  训练集: {len(train_data)} 个路口场景")
+        print(f"  验证集: {len(val_data)} 个路口场景")
+        
+        # 3. 创建数据集
+        print(f"\n🔄 步骤2: 创建路口数据集")
+        train_dataset = IntersectionGraphDataset(train_data)
+        val_dataset = IntersectionGraphDataset(val_data)
+        
+        if len(train_dataset) == 0 or len(val_dataset) == 0:
+            print("❌ 路口数据集创建失败")
+            return
+        
+        # 4. 训练路口GNN模型
+        print(f"\n🛡️ 步骤3: 训练路口GNN模型")
+        trainer = IntersectionGNNTrainer(config)
+        trainer.train(train_dataset, val_dataset)
+        
+        # 5. 保存模型
+        trainer.save_model('final_intersection_gnn_model.pth')
+        
+        print(f"\n✅ 🛡️ 路口GNN预训练完成！")
+        print(f"  最佳模型: best_intersection_gnn_model.pth")
+        print(f"  最终模型: final_intersection_gnn_model.pth")
+        print(f"\n🎯 🛡️ 路口模型特性:")
+        print(f"  ✅ 兼容lifelong_planning.py的8维特征")
+        print(f"  ✅ 支持intersection_edges地图格式")
+        print(f"  ✅ 40%高冲突场景训练安全避让")
+        print(f"  ✅ 路口安全优先决策 (权重1.8x)")
+        print(f"  ✅ 每条边一个任务的专门训练")
+        
+        print(f"\n🛡️ 使用方法:")
+        print(f"  现在可以运行 lifelong_planning.py")
+        print(f"  系统将自动加载预训练的路口GNN模型")
+        print(f"  享受路口安全智能规划！")
+        
+    except Exception as e:
+        print(f"❌ 路口预训练过程中出现错误: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
-    safe_main()
+    main()
